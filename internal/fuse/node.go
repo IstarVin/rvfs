@@ -9,21 +9,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // RootState holds shared state for all nodes in the FUSE tree.
 type RootState struct {
-	backingDir string
+	cache *cache.CacheLayer
 }
 
 // FuseNode is a node in the FUSE filesystem tree.
-// Each node corresponds to one path relative to the backing directory.
+// Each node corresponds to one path relative to the cache root.
 type FuseNode struct {
 	fs.Inode
-	rel   string // path relative to backingDir, "" for root
-	root  *RootState
+	rel  string // path relative to cache root, "" for root
+	root *RootState
 }
 
 // inodeFor computes a stable inode number from a relative path using FNV-64a.
@@ -39,14 +40,6 @@ func inodeFor(rel string) uint64 {
 		return 1
 	}
 	return v
-}
-
-// pathOf returns the absolute backing-dir path for this node.
-func (n *FuseNode) pathOf() string {
-	if n.rel == "" {
-		return n.root.backingDir
-	}
-	return filepath.Join(n.root.backingDir, n.rel)
 }
 
 // childRel returns the relative path for a child of this node.
@@ -77,23 +70,62 @@ func fillAttr(st *syscall.Stat_t, out *gofuse.Attr) {
 	out.Blksize = uint32(st.Blksize)
 }
 
+// fillAttrFromEntry populates a fuse.Attr from a cache.FileEntry.
+// Fields not tracked in the DB (uid, gid, timestamps) use reasonable defaults.
+func fillAttrFromEntry(e *cache.FileEntry, out *gofuse.Attr) {
+	out.Mode = e.Mode
+	out.Size = uint64(e.Size)
+	if e.IsDir {
+		out.Nlink = 2
+	} else {
+		out.Nlink = 1
+	}
+	out.Mtime = uint64(e.LocalMtime)
+	out.Atime = uint64(e.LocalMtime)
+	out.Ctime = uint64(e.LocalMtime)
+	out.Uid = uint32(os.Getuid())
+	out.Gid = uint32(os.Getgid())
+	out.Blksize = 4096
+	out.Blocks = (uint64(e.Size) + 511) / 512
+}
+
+// toErrno converts an error to a syscall.Errno.
+func toErrno(err error) syscall.Errno {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno
+	}
+	if pe, ok := err.(*os.PathError); ok {
+		if errno, ok := pe.Err.(syscall.Errno); ok {
+			return errno
+		}
+	}
+	return syscall.EIO
+}
+
 // --- NodeLookuper ---
 
 var _ fs.NodeLookuper = (*FuseNode)(nil)
 
 func (n *FuseNode) Lookup(ctx context.Context, name string, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	rel := n.childRel(name)
-	fullPath := filepath.Join(n.root.backingDir, rel)
 
-	var st syscall.Stat_t
-	if err := syscall.Lstat(fullPath, &st); err != nil {
-		return nil, err.(syscall.Errno)
+	entry, err := n.root.cache.Stat(rel)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	if entry == nil {
+		return nil, syscall.ENOENT
 	}
 
-	fillAttr(&st, &out.Attr)
+	fillAttrFromEntry(entry, &out.Attr)
+
+	// Stat the disk file for full POSIX attrs (timestamps, uid/gid).
+	if st, err := n.root.cache.LstatDisk(rel); err == nil {
+		fillAttr(st, &out.Attr)
+	}
 
 	child := n.NewInode(ctx, &FuseNode{rel: rel, root: n.root}, fs.StableAttr{
-		Mode: st.Mode,
+		Mode: entry.Mode,
 		Ino:  inodeFor(rel),
 	})
 	return child, 0
@@ -104,11 +136,29 @@ func (n *FuseNode) Lookup(ctx context.Context, name string, out *gofuse.EntryOut
 var _ fs.NodeGetattrer = (*FuseNode)(nil)
 
 func (n *FuseNode) Getattr(ctx context.Context, fh fs.FileHandle, out *gofuse.AttrOut) syscall.Errno {
-	var st syscall.Stat_t
-	if err := syscall.Lstat(n.pathOf(), &st); err != nil {
-		return err.(syscall.Errno)
+	if n.rel == "" {
+		// Root node: stat the cache files directory.
+		st, err := n.root.cache.LstatDisk("")
+		if err != nil {
+			return toErrno(err)
+		}
+		fillAttr(st, &out.Attr)
+		return 0
 	}
-	fillAttr(&st, &out.Attr)
+
+	entry, err := n.root.cache.Stat(n.rel)
+	if err != nil {
+		return syscall.EIO
+	}
+	if entry == nil {
+		return syscall.ENOENT
+	}
+
+	fillAttrFromEntry(entry, &out.Attr)
+
+	if st, err := n.root.cache.LstatDisk(n.rel); err == nil {
+		fillAttr(st, &out.Attr)
+	}
 	return 0
 }
 
@@ -117,17 +167,17 @@ func (n *FuseNode) Getattr(ctx context.Context, fh fs.FileHandle, out *gofuse.At
 var _ fs.NodeSetattrer = (*FuseNode)(nil)
 
 func (n *FuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *gofuse.SetAttrIn, out *gofuse.AttrOut) syscall.Errno {
-	p := n.pathOf()
+	rel := n.rel
 
 	if mode, ok := in.GetMode(); ok {
-		if err := os.Chmod(p, os.FileMode(mode)); err != nil {
-			return err.(*os.PathError).Err.(syscall.Errno)
+		if err := n.root.cache.Chmod(rel, os.FileMode(mode)); err != nil {
+			return toErrno(err)
 		}
 	}
 
 	if sz, ok := in.GetSize(); ok {
-		if err := os.Truncate(p, int64(sz)); err != nil {
-			return err.(*os.PathError).Err.(syscall.Errno)
+		if err := n.root.cache.Truncate(rel, int64(sz)); err != nil {
+			return toErrno(err)
 		}
 	}
 
@@ -136,10 +186,9 @@ func (n *FuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *gofuse.Set
 	mtime, mok := in.GetMTime()
 	if aok || mok {
 		if !aok || !mok {
-			// Fill in whichever side wasn't set from the current stat.
-			var st syscall.Stat_t
-			if err := syscall.Lstat(p, &st); err != nil {
-				return err.(syscall.Errno)
+			st, err := n.root.cache.LstatDisk(rel)
+			if err != nil {
+				return toErrno(err)
 			}
 			if !aok {
 				atime = time.Unix(st.Atim.Sec, st.Atim.Nsec)
@@ -148,16 +197,16 @@ func (n *FuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *gofuse.Set
 				mtime = time.Unix(st.Mtim.Sec, st.Mtim.Nsec)
 			}
 		}
-		if err := os.Chtimes(p, atime, mtime); err != nil {
-			return err.(*os.PathError).Err.(syscall.Errno)
+		if err := n.root.cache.Chtimes(rel, atime, mtime); err != nil {
+			return toErrno(err)
 		}
 	}
 
-	var st syscall.Stat_t
-	if err := syscall.Lstat(p, &st); err != nil {
-		return err.(syscall.Errno)
+	st, err := n.root.cache.LstatDisk(rel)
+	if err != nil {
+		return toErrno(err)
 	}
-	fillAttr(&st, &out.Attr)
+	fillAttr(st, &out.Attr)
 	return 0
 }
 
@@ -166,23 +215,17 @@ func (n *FuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *gofuse.Set
 var _ fs.NodeReaddirer = (*FuseNode)(nil)
 
 func (n *FuseNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	entries, err := os.ReadDir(n.pathOf())
+	entries, err := n.root.cache.ReadDir(n.rel)
 	if err != nil {
-		return nil, err.(*os.PathError).Err.(syscall.Errno)
+		return nil, syscall.EIO
 	}
 
 	var list []gofuse.DirEntry
 	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		// Retrieve POSIX mode via Sys() to get correct file-type bits.
-		st := info.Sys().(*syscall.Stat_t)
 		list = append(list, gofuse.DirEntry{
-			Mode: st.Mode,
-			Name: e.Name(),
-			Ino:  inodeFor(n.childRel(e.Name())),
+			Mode: e.Mode,
+			Name: filepath.Base(e.Path),
+			Ino:  inodeFor(e.Path),
 		})
 	}
 	return fs.NewListDirStream(list), 0
@@ -193,9 +236,9 @@ func (n *FuseNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 var _ fs.NodeOpener = (*FuseNode)(nil)
 
 func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	f, err := os.OpenFile(n.pathOf(), int(flags), 0)
+	f, err := n.root.cache.Open(n.rel, int(flags))
 	if err != nil {
-		return nil, 0, err.(*os.PathError).Err.(syscall.Errno)
+		return nil, 0, toErrno(err)
 	}
 	return &fileHandle{f: f}, 0, 0
 }
@@ -206,22 +249,21 @@ var _ fs.NodeCreater = (*FuseNode)(nil)
 
 func (n *FuseNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *gofuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	rel := n.childRel(name)
-	fullPath := filepath.Join(n.root.backingDir, rel)
 
-	f, err := os.OpenFile(fullPath, int(flags)|os.O_CREATE, os.FileMode(mode))
+	f, entry, err := n.root.cache.Create(rel, mode)
 	if err != nil {
-		return nil, nil, 0, err.(*os.PathError).Err.(syscall.Errno)
+		return nil, nil, 0, toErrno(err)
 	}
 
-	var st syscall.Stat_t
-	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
-		f.Close()
-		return nil, nil, 0, err.(syscall.Errno)
+	fillAttrFromEntry(entry, &out.Attr)
+
+	// Get full POSIX attrs from the open fd.
+	if st, err := n.root.cache.FstatDisk(int(f.Fd())); err == nil {
+		fillAttr(st, &out.Attr)
 	}
-	fillAttr(&st, &out.Attr)
 
 	child := n.NewInode(ctx, &FuseNode{rel: rel, root: n.root}, fs.StableAttr{
-		Mode: st.Mode,
+		Mode: entry.Mode,
 		Ino:  inodeFor(rel),
 	})
 	return child, &fileHandle{f: f}, 0, 0
@@ -233,8 +275,8 @@ var _ fs.NodeUnlinker = (*FuseNode)(nil)
 
 func (n *FuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	rel := n.childRel(name)
-	if err := os.Remove(filepath.Join(n.root.backingDir, rel)); err != nil {
-		return err.(*os.PathError).Err.(syscall.Errno)
+	if err := n.root.cache.Delete(rel); err != nil {
+		return toErrno(err)
 	}
 	return 0
 }
@@ -245,22 +287,22 @@ var _ fs.NodeMkdirer = (*FuseNode)(nil)
 
 func (n *FuseNode) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	rel := n.childRel(name)
-	fullPath := filepath.Join(n.root.backingDir, rel)
 
-	if err := os.Mkdir(fullPath, os.FileMode(mode)); err != nil {
-		return nil, err.(*os.PathError).Err.(syscall.Errno)
+	entry, err := n.root.cache.Mkdir(rel, mode)
+	if err != nil {
+		return nil, toErrno(err)
 	}
 
-	var st syscall.Stat_t
-	if err := syscall.Lstat(fullPath, &st); err != nil {
-		return nil, err.(syscall.Errno)
+	fillAttrFromEntry(entry, &out.Attr)
+
+	if st, err := n.root.cache.LstatDisk(rel); err == nil {
+		fillAttr(st, &out.Attr)
 	}
-	fillAttr(&st, &out.Attr)
-	// out.Attr.Mode must include S_IFDIR (from Stat_t.Mode).
+	// out.Attr.Mode must include S_IFDIR (from Stat_t.Mode or entry.Mode).
 	// The go-fuse bridge asserts: out.Attr.Mode &^ 07777 == syscall.S_IFDIR.
 
 	child := n.NewInode(ctx, &FuseNode{rel: rel, root: n.root}, fs.StableAttr{
-		Mode: st.Mode,
+		Mode: entry.Mode,
 		Ino:  inodeFor(rel),
 	})
 	return child, 0
@@ -272,8 +314,8 @@ var _ fs.NodeRmdirer = (*FuseNode)(nil)
 
 func (n *FuseNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	rel := n.childRel(name)
-	if err := os.Remove(filepath.Join(n.root.backingDir, rel)); err != nil {
-		return err.(*os.PathError).Err.(syscall.Errno)
+	if err := n.root.cache.Rmdir(rel); err != nil {
+		return toErrno(err)
 	}
 	return 0
 }
@@ -287,10 +329,10 @@ func (n *FuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 	if !ok {
 		return syscall.EINVAL
 	}
-	oldPath := filepath.Join(n.root.backingDir, n.childRel(name))
-	newPath := filepath.Join(n.root.backingDir, newParentNode.childRel(newName))
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return err.(*os.PathError).Err.(syscall.Errno)
+	oldRel := n.childRel(name)
+	newRel := newParentNode.childRel(newName)
+	if err := n.root.cache.Rename(oldRel, newRel); err != nil {
+		return toErrno(err)
 	}
 	return 0
 }
@@ -317,14 +359,14 @@ func (fh *fileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.
 func (fh *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	n, err := fh.f.WriteAt(data, off)
 	if err != nil {
-		return uint32(n), err.(*os.PathError).Err.(syscall.Errno)
+		return uint32(n), toErrno(err)
 	}
 	return uint32(n), 0
 }
 
 func (fh *fileHandle) Release(ctx context.Context) syscall.Errno {
 	if err := fh.f.Close(); err != nil {
-		return err.(*os.PathError).Err.(syscall.Errno)
+		return toErrno(err)
 	}
 	return 0
 }

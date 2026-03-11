@@ -16,6 +16,9 @@ test:
 test-fuse:
 	go test -v -timeout 120s ./internal/fuse/...
 
+test-cache:
+	go test -v ./internal/cache/...
+
 test-config:
 	go test -v ./internal/config/...
 

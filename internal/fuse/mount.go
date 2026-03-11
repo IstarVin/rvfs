@@ -5,6 +5,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -17,17 +18,23 @@ type MountOptions struct {
 	Name string
 }
 
-// Mount mounts backingDir at mountpoint and returns the running FUSE server.
+// Mount creates a CacheLayer for the given remote-id, mounts it at mountpoint,
+// and returns the running FUSE server.
 // The caller should call server.Wait() to block, and signal handling is
 // set up automatically to unmount on SIGINT/SIGTERM.
-func Mount(backingDir, mountpoint string, opts MountOptions) (*gofuse.Server, error) {
+func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.CacheLayer, *gofuse.Server, error) {
 	if err := os.MkdirAll(mountpoint, 0755); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	cl, err := cache.NewCacheLayer(cacheBase, remoteID)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	root := &FuseNode{
 		rel:  "",
-		root: &RootState{backingDir: backingDir},
+		root: &RootState{cache: cl},
 	}
 
 	fsName := opts.Name
@@ -42,17 +49,18 @@ func Mount(backingDir, mountpoint string, opts MountOptions) (*gofuse.Server, er
 			Ino:  inodeFor(""),
 		},
 		MountOptions: gofuse.MountOptions{
-			Debug:      opts.Debug,
-			Name:       fsName,
-			FsName:     backingDir,
-			MaxWrite:   1 << 20, // 1 MiB write buffer
+			Debug:       opts.Debug,
+			Name:        fsName,
+			FsName:      remoteID,
+			MaxWrite:    1 << 20, // 1 MiB write buffer
 			EnableLocks: true,
 		},
 	}
 
 	server, err := fs.Mount(mountpoint, root, fsOpts)
 	if err != nil {
-		return nil, err
+		cl.Close()
+		return nil, nil, err
 	}
 
 	// Unmount cleanly on SIGINT or SIGTERM.
@@ -63,5 +71,5 @@ func Mount(backingDir, mountpoint string, opts MountOptions) (*gofuse.Server, er
 		_ = server.Unmount()
 	}()
 
-	return server, nil
+	return cl, server, nil
 }

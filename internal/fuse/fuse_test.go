@@ -9,24 +9,32 @@ import (
 	rvfuse "github.com/IstarVin/rvfs/internal/fuse"
 )
 
-// mountForTest creates a backing dir and mountpoint, mounts the backing dir,
-// and registers cleanup (unmount + remove dirs) on t.
-// Returns mountpoint path.
+// mountForTest creates a cache layer seeded from a temporary backing dir,
+// mounts it, and registers cleanup (unmount + remove dirs) on t.
+// Returns the mountpoint path and the backing dir (for pre-seeding files).
 func mountForTest(t *testing.T) string {
 	t.Helper()
 
 	backingDir := t.TempDir()
+	cacheBase := t.TempDir()
 	mountpoint := t.TempDir()
 
-	server, err := rvfuse.Mount(backingDir, mountpoint, rvfuse.MountOptions{})
+	cl, server, err := rvfuse.Mount(cacheBase, "test", mountpoint, rvfuse.MountOptions{})
 	if err != nil {
 		t.Fatalf("Mount: %v", err)
+	}
+
+	// Seed the cache from the (empty) backing dir so the root dir entry exists.
+	if err := cl.SeedFromDir(backingDir); err != nil {
+		server.Unmount()
+		t.Fatalf("SeedFromDir: %v", err)
 	}
 
 	t.Cleanup(func() {
 		if err := server.Unmount(); err != nil {
 			t.Logf("Unmount: %v", err)
 		}
+		cl.Close()
 	})
 
 	return mountpoint
