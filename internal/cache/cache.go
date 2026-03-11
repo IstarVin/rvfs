@@ -517,14 +517,23 @@ func (c *CacheLayer) FstatDisk(fd int) (*syscall.Stat_t, error) {
 	return &st, nil
 }
 
-// OpenOrCreate creates a sparse cache file for a remote download.
-// The file is truncated to the given size (creating a sparse file on
-// filesystems that support it) and returned open for read/write.
+// OpenOrCreate opens an existing cache file if it already has the expected
+// size (preserving partially-downloaded data for resume), or creates a new
+// sparse file truncated to size.
 func (c *CacheLayer) OpenOrCreate(rel string, size int64) (*os.File, error) {
 	dp := c.diskPath(rel)
 	if err := os.MkdirAll(filepath.Dir(dp), 0755); err != nil {
 		return nil, err
 	}
+
+	// Try to reuse existing file if it has the right size (resume).
+	if info, err := os.Stat(dp); err == nil && info.Size() == size {
+		f, err := os.OpenFile(dp, os.O_RDWR, 0644)
+		if err == nil {
+			return f, nil
+		}
+	}
+
 	f, err := os.OpenFile(dp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return nil, err

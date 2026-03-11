@@ -1,10 +1,12 @@
 package download
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/remote"
@@ -12,11 +14,17 @@ import (
 
 const (
 	// chunkSize is the size of chunks read from the remote during download.
-	chunkSize = 256 * 1024 // 256 KiB
+	chunkSize = 1 * 1024 * 1024 // 1 MiB
 
-	// seekThreshold is the minimum gap between the sequential download
-	// position and a requested offset before we spawn a range goroutine.
-	seekThreshold = 1 * 1024 * 1024 // 1 MiB
+	// goroutineWindow is the distance within which we consider a goroutine
+	// "close enough" to cover a requested offset — no new goroutine needed.
+	goroutineWindow = 2 * 1024 * 1024 // 2 MiB
+
+	// persistInterval is how often we flush CachedRanges to the DB.
+	persistInterval = 5 * time.Second
+
+	// persistBytes is the byte threshold to flush CachedRanges to the DB.
+	persistBytes = 5 * 1024 * 1024 // 5 MiB
 )
 
 // Manager manages all in-progress remote→cache downloads.
@@ -37,13 +45,6 @@ func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer) *Manager {
 	}
 }
 
-// waiter represents a goroutine blocked waiting for a byte range.
-type waiter struct {
-	offset int64
-	size   int64
-	ch     chan error
-}
-
 // Download tracks the state of a single file being downloaded.
 type Download struct {
 	path      string
@@ -51,15 +52,25 @@ type Download struct {
 	rangeSet  *RangeSet
 	totalSize int64
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	waiters []waiter
-	seqPos  int64 // position of the sequential download goroutine
-	err     error // first fatal error
-	done    bool
+	mu     sync.Mutex
+	cond   *sync.Cond
+	seqPos int64 // current position of the sequential download goroutine
+	err    error // first fatal error
+	done   bool
 
-	goroutines map[int64]func() // startOffset → cancel function
+	// goroutines maps startOffset → (cancel func, current position).
+	goroutines map[int64]*goroutineInfo
 	mgr        *Manager
+
+	// Periodic persistence state.
+	lastPersist      time.Time
+	bytesSincePersit int64
+}
+
+// goroutineInfo tracks a running download goroutine.
+type goroutineInfo struct {
+	cancel func()
+	pos    int64 // current download position (updated by the goroutine)
 }
 
 // Start begins downloading a remote file into the cache. If a download for
@@ -69,7 +80,6 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 	m.mu.Lock()
 	if dl, ok := m.downloads[path]; ok {
 		m.mu.Unlock()
-		// Open a separate read fd for this caller.
 		f, err := m.cache.Open(path, os.O_RDONLY)
 		if err != nil {
 			return nil, nil, err
@@ -78,24 +88,32 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 	}
 	m.mu.Unlock()
 
-	// Create sparse cache file.
+	// Create (or reuse) sparse cache file.
 	cacheFile, err := m.cache.OpenOrCreate(path, totalSize)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create cache file for %q: %w", path, err)
 	}
 
 	dl := &Download{
-		path:       path,
-		cacheFile:  cacheFile,
-		rangeSet:   NewRangeSet(),
-		totalSize:  totalSize,
-		goroutines: make(map[int64]func()),
-		mgr:        m,
+		path:        path,
+		cacheFile:   cacheFile,
+		rangeSet:    NewRangeSet(),
+		totalSize:   totalSize,
+		goroutines:  make(map[int64]*goroutineInfo),
+		mgr:         m,
+		lastPersist: time.Now(),
 	}
 	dl.cond = sync.NewCond(&dl.mu)
 
+	// Resume: load persisted CachedRanges from DB.
+	if entry, err := m.cache.Stat(path); err == nil && entry != nil && entry.CachedRanges != "" {
+		var rs RangeSet
+		if err := json.Unmarshal([]byte(entry.CachedRanges), &rs); err == nil && rs.Len() > 0 {
+			dl.rangeSet = &rs
+		}
+	}
+
 	m.mu.Lock()
-	// Double-check after releasing/reacquiring lock.
 	if existing, ok := m.downloads[path]; ok {
 		m.mu.Unlock()
 		cacheFile.Close()
@@ -108,13 +126,21 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 	m.downloads[path] = dl
 	m.mu.Unlock()
 
-	// Mark as downloading in DB.
 	_ = m.cache.DB().SetState(path, cache.StateDownloading)
 
-	// Spawn sequential download goroutine from offset 0.
-	dl.spawnGoroutine(0, true)
+	// Spawn sequential download goroutine from the first gap.
+	seqStart := int64(0)
+	if gaps := dl.rangeSet.Gaps(totalSize); len(gaps) > 0 {
+		seqStart = gaps[0].Start
+	}
+	if !dl.rangeSet.IsComplete(totalSize) {
+		dl.spawnGoroutine(seqStart, true)
+	} else {
+		// Already fully cached — mark done immediately.
+		dl.done = true
+		go dl.finish()
+	}
 
-	// Open separate read fd for the caller.
 	readFile, err := m.cache.Open(path, os.O_RDONLY)
 	if err != nil {
 		return nil, nil, err
@@ -130,11 +156,40 @@ func (m *Manager) WaitForRange(path string, offset, size int64) error {
 	m.mu.Unlock()
 
 	if !ok {
-		// No active download — data should already be on disk (state clean/dirty).
 		return nil
 	}
 
 	return dl.waitForRange(offset, size)
+}
+
+// Hint signals that the next read is likely at nextOffset. If the range is
+// not yet downloaded and no goroutine covers it, a new one is spawned.
+// Non-blocking.
+func (m *Manager) Hint(path string, nextOffset int64) {
+	m.mu.Lock()
+	dl, ok := m.downloads[path]
+	m.mu.Unlock()
+
+	if !ok || dl == nil {
+		return
+	}
+
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	if dl.done || dl.err != nil {
+		return
+	}
+
+	// If the hinted range is already cached, nothing to do.
+	if dl.rangeSet.Contains(nextOffset, chunkSize) {
+		return
+	}
+
+	// Spawn a goroutine if none is close enough.
+	if !dl.hasGoroutineNear(nextOffset) {
+		dl.spawnGoroutine(nextOffset, false)
+	}
 }
 
 // Cancel cancels all goroutines for a download and removes it from the manager.
@@ -170,18 +225,19 @@ func (dl *Download) waitForRange(offset, size int64) error {
 		return nil
 	}
 
-	// If download already errored, return the error.
 	if dl.err != nil {
 		return dl.err
 	}
 
-	// If the sequential goroutine is far behind the requested offset,
-	// spawn a range goroutine to jump ahead.
-	if offset-dl.seqPos > seekThreshold {
-		dl.mu.Unlock()
-		dl.maybeSpawnRange(offset)
-		dl.mu.Lock()
+	// Spawn an on-demand goroutine if no goroutine is close to the
+	// requested offset. This enables immediate streaming from any
+	// position instead of waiting for the sequential goroutine.
+	if !dl.hasGoroutineNear(offset) {
+		dl.spawnGoroutine(offset, false)
 	}
+
+	// Cancel far-behind non-sequential goroutines to save bandwidth.
+	dl.cancelFarBehind(offset)
 
 	// Wait until the range is covered or an error occurs.
 	for !dl.rangeSet.Contains(offset, size) && dl.err == nil {
@@ -191,44 +247,60 @@ func (dl *Download) waitForRange(offset, size int64) error {
 	return dl.err
 }
 
-func (dl *Download) maybeSpawnRange(offset int64) {
-	dl.mu.Lock()
-	defer dl.mu.Unlock()
-
-	// Don't spawn if already have a goroutine covering this area.
-	for startOff := range dl.goroutines {
-		if startOff <= offset && offset-startOff < seekThreshold {
-			return
+// hasGoroutineNear returns true if any goroutine's current position is
+// within goroutineWindow bytes before offset, or between offset and
+// offset+goroutineWindow (i.e. downloading data that will soon cover offset).
+func (dl *Download) hasGoroutineNear(offset int64) bool {
+	for _, gi := range dl.goroutines {
+		// Goroutine is ahead but close, or behind but close.
+		if gi.pos <= offset && offset-gi.pos < goroutineWindow {
+			return true
+		}
+		if gi.pos > offset && gi.pos-offset < goroutineWindow {
+			return true
 		}
 	}
+	return false
+}
 
-	dl.spawnGoroutine(offset, false)
+// cancelFarBehind cancels non-sequential goroutines whose position is
+// more than goroutineWindow behind the requested offset.
+func (dl *Download) cancelFarBehind(offset int64) {
+	for startOff, gi := range dl.goroutines {
+		// Never cancel the sequential goroutine (it fills the whole file).
+		if startOff == dl.seqPos || gi.pos >= offset {
+			continue
+		}
+		if offset-gi.pos > goroutineWindow {
+			gi.cancel()
+		}
+	}
 }
 
 func (dl *Download) spawnGoroutine(startOffset int64, isSequential bool) {
-	// Use a done channel as the cancellation mechanism.
 	doneCh := make(chan struct{})
-	dl.goroutines[startOffset] = func() { close(doneCh) }
+	gi := &goroutineInfo{
+		cancel: sync.OnceFunc(func() { close(doneCh) }),
+		pos:    startOffset,
+	}
+	dl.goroutines[startOffset] = gi
 
-	go dl.downloadLoop(startOffset, isSequential, doneCh)
+	go dl.downloadLoop(startOffset, isSequential, doneCh, gi)
 }
 
-func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh chan struct{}) {
+func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh chan struct{}, gi *goroutineInfo) {
 	defer func() {
 		dl.mu.Lock()
 		delete(dl.goroutines, startOffset)
-		// If this was the last goroutine and we're complete, mark done.
 		if dl.rangeSet.IsComplete(dl.totalSize) && !dl.done {
 			dl.done = true
 			dl.cond.Broadcast()
-			// Mark clean in DB and remove from manager.
 			go dl.finish()
 		}
 		dl.mu.Unlock()
 	}()
 
-	offset := startOffset
-	remaining := dl.totalSize - offset
+	remaining := dl.totalSize - startOffset
 	if remaining <= 0 {
 		return
 	}
@@ -247,7 +319,7 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 	}()
 
 	buf := make([]byte, chunkSize)
-	pos := offset
+	pos := startOffset
 
 	for {
 		select {
@@ -259,7 +331,6 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 
 		n, err := pr.Read(buf)
 		if n > 0 {
-			// Write chunk to cache file at correct offset.
 			if _, werr := dl.cacheFile.WriteAt(buf[:n], pos); werr != nil {
 				dl.mu.Lock()
 				if dl.err == nil {
@@ -273,13 +344,28 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 
 			dl.mu.Lock()
 			dl.rangeSet.Add(pos, int64(n))
+			pos += int64(n)
+			gi.pos = pos
 			if isSequential {
-				dl.seqPos = pos + int64(n)
+				dl.seqPos = pos
 			}
+			dl.bytesSincePersit += int64(n)
 			dl.cond.Broadcast()
+
+			// Periodically persist CachedRanges to DB for crash recovery.
+			if dl.bytesSincePersit >= persistBytes || time.Since(dl.lastPersist) >= persistInterval {
+				dl.persistRangesLocked()
+			}
+
+			// Stop if the next chunk is already downloaded (another
+			// goroutine covered it) — avoids redundant network I/O.
+			nextCovered := dl.rangeSet.Contains(pos, chunkSize) && pos+chunkSize <= dl.totalSize
 			dl.mu.Unlock()
 
-			pos += int64(n)
+			if nextCovered && !isSequential {
+				pr.Close()
+				return
+			}
 		}
 
 		if err != nil {
@@ -297,10 +383,27 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 	}
 }
 
+// persistRangesLocked writes the current CachedRanges to the DB.
+// Must be called with dl.mu held.
+func (dl *Download) persistRangesLocked() {
+	rangesJSON, _ := dl.rangeSet.MarshalJSON()
+	dl.lastPersist = time.Now()
+	dl.bytesSincePersit = 0
+
+	// Run DB update without holding the download lock.
+	go func() {
+		entry, err := dl.mgr.cache.Stat(dl.path)
+		if err == nil && entry != nil {
+			entry.CachedRanges = string(rangesJSON)
+			entry.State = cache.StateDownloading
+			_ = dl.mgr.cache.DB().PutFile(entry)
+		}
+	}()
+}
+
 func (dl *Download) finish() {
 	dl.cacheFile.Close()
 
-	// Update DB: set state clean, update cached_ranges.
 	rangesJSON, _ := dl.rangeSet.MarshalJSON()
 	entry, err := dl.mgr.cache.Stat(dl.path)
 	if err == nil && entry != nil {
@@ -316,11 +419,14 @@ func (dl *Download) finish() {
 
 func (dl *Download) cancel() {
 	dl.mu.Lock()
-	for _, cancelFn := range dl.goroutines {
-		cancelFn()
+	for _, gi := range dl.goroutines {
+		gi.cancel()
 	}
 	dl.err = fmt.Errorf("download cancelled")
 	dl.cond.Broadcast()
+
+	// Persist ranges before closing so partial progress is saved.
+	dl.persistRangesLocked()
 	dl.mu.Unlock()
 
 	dl.cacheFile.Close()

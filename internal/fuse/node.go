@@ -420,6 +420,11 @@ func (dh *downloadFileHandle) Read(ctx context.Context, dest []byte, off int64) 
 	if err != nil && err != io.EOF {
 		return nil, syscall.EIO
 	}
+
+	// Hint the download manager about the next likely read position
+	// so it can prefetch data ahead of the reader for smooth streaming.
+	dh.mgr.Hint(dh.path, off+int64(n))
+
 	return gofuse.ReadResultData(dest[:n]), 0
 }
 
