@@ -10,13 +10,15 @@ import (
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/download"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // RootState holds shared state for all nodes in the FUSE tree.
 type RootState struct {
-	cache *cache.CacheLayer
+	cache       *cache.CacheLayer
+	downloadMgr *download.Manager // nil when using backing-dir mode
 }
 
 // FuseNode is a node in the FUSE filesystem tree.
@@ -119,9 +121,11 @@ func (n *FuseNode) Lookup(ctx context.Context, name string, out *gofuse.EntryOut
 
 	fillAttrFromEntry(entry, &out.Attr)
 
-	// Stat the disk file for full POSIX attrs (timestamps, uid/gid).
-	if st, err := n.root.cache.LstatDisk(rel); err == nil {
-		fillAttr(st, &out.Attr)
+	// For evicted entries the file doesn't exist on disk; skip LstatDisk.
+	if entry.State != cache.StateEvicted {
+		if st, err := n.root.cache.LstatDisk(rel); err == nil {
+			fillAttr(st, &out.Attr)
+		}
 	}
 
 	child := n.NewInode(ctx, &FuseNode{rel: rel, root: n.root}, fs.StableAttr{
@@ -156,8 +160,11 @@ func (n *FuseNode) Getattr(ctx context.Context, fh fs.FileHandle, out *gofuse.At
 
 	fillAttrFromEntry(entry, &out.Attr)
 
-	if st, err := n.root.cache.LstatDisk(n.rel); err == nil {
-		fillAttr(st, &out.Attr)
+	// For evicted entries the file doesn't exist on disk; skip LstatDisk.
+	if entry.State != cache.StateEvicted {
+		if st, err := n.root.cache.LstatDisk(n.rel); err == nil {
+			fillAttr(st, &out.Attr)
+		}
 	}
 	return 0
 }
@@ -236,6 +243,26 @@ func (n *FuseNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 var _ fs.NodeOpener = (*FuseNode)(nil)
 
 func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	// Check if this file needs to be downloaded from remote.
+	if n.root.downloadMgr != nil {
+		entry, err := n.root.cache.Stat(n.rel)
+		if err != nil {
+			return nil, 0, syscall.EIO
+		}
+		if entry != nil && (entry.State == cache.StateEvicted || entry.State == cache.StateDownloading) {
+			dl, readFile, err := n.root.downloadMgr.Start(n.rel, entry.Size)
+			if err != nil {
+				return nil, 0, syscall.EIO
+			}
+			return &downloadFileHandle{
+				f:    readFile,
+				dl:   dl,
+				path: n.rel,
+				mgr:  n.root.downloadMgr,
+			}, 0, 0
+		}
+	}
+
 	f, err := n.root.cache.Open(n.rel, int(flags))
 	if err != nil {
 		return nil, 0, toErrno(err)
@@ -366,6 +393,38 @@ func (fh *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32
 
 func (fh *fileHandle) Release(ctx context.Context) syscall.Errno {
 	if err := fh.f.Close(); err != nil {
+		return toErrno(err)
+	}
+	return 0
+}
+
+// --- downloadFileHandle ---
+
+// downloadFileHandle wraps a file being downloaded from a remote. Read calls
+// block until the requested range is available. Write is not supported.
+type downloadFileHandle struct {
+	f    *os.File
+	dl   *download.Download
+	path string
+	mgr  *download.Manager
+}
+
+var _ fs.FileReader = (*downloadFileHandle)(nil)
+var _ fs.FileReleaser = (*downloadFileHandle)(nil)
+
+func (dh *downloadFileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadResult, syscall.Errno) {
+	if err := dh.mgr.WaitForRange(dh.path, off, int64(len(dest))); err != nil {
+		return nil, syscall.EIO
+	}
+	n, err := dh.f.ReadAt(dest, off)
+	if err != nil && err != io.EOF {
+		return nil, syscall.EIO
+	}
+	return gofuse.ReadResultData(dest[:n]), 0
+}
+
+func (dh *downloadFileHandle) Release(ctx context.Context) syscall.Errno {
+	if err := dh.f.Close(); err != nil {
 		return toErrno(err)
 	}
 	return 0

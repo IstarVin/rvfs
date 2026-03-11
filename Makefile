@@ -22,6 +22,9 @@ test-cache:
 test-config:
 	go test -v ./internal/config/...
 
+test-download:
+	go test -v ./internal/download/...
+
 lint:
 	golangci-lint run ./...
 

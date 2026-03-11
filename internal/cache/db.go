@@ -114,6 +114,13 @@ CREATE TABLE IF NOT EXISTS pending_ops (
 	attempts   INTEGER NOT NULL DEFAULT 0,
 	last_error TEXT    NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS drive_path_ids (
+	path      TEXT PRIMARY KEY,
+	drive_id  TEXT    NOT NULL,
+	etag      TEXT    NOT NULL DEFAULT '',
+	last_seen INTEGER NOT NULL DEFAULT 0
+);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -345,4 +352,61 @@ func (m *MetadataDB) CompletePendingOp(id int64) error {
 // BeginTx starts a new transaction.
 func (m *MetadataDB) BeginTx() (*sql.Tx, error) {
 	return m.db.Begin()
+}
+
+// ---------- drive_path_ids CRUD ----------
+
+// DrivePathEntry mirrors one row in the drive_path_ids table.
+type DrivePathEntry struct {
+	Path     string
+	DriveID  string
+	ETag     string
+	LastSeen int64
+}
+
+// GetDriveID returns the Drive file ID for the given path, or "" if not cached.
+func (m *MetadataDB) GetDriveID(path string) (string, error) {
+	var id string
+	err := m.db.QueryRow(`SELECT drive_id FROM drive_path_ids WHERE path = ?`, path).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get drive id %q: %w", path, err)
+	}
+	return id, nil
+}
+
+// PutDriveID inserts or updates a path→driveID mapping.
+func (m *MetadataDB) PutDriveID(e *DrivePathEntry) error {
+	_, err := m.db.Exec(`
+		INSERT INTO drive_path_ids (path, drive_id, etag, last_seen)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			drive_id  = excluded.drive_id,
+			etag      = excluded.etag,
+			last_seen = excluded.last_seen`,
+		e.Path, e.DriveID, e.ETag, e.LastSeen)
+	if err != nil {
+		return fmt.Errorf("put drive id %q: %w", e.Path, err)
+	}
+	return nil
+}
+
+// DeleteDriveID removes the path→driveID mapping for the given path.
+func (m *MetadataDB) DeleteDriveID(path string) error {
+	_, err := m.db.Exec(`DELETE FROM drive_path_ids WHERE path = ?`, path)
+	if err != nil {
+		return fmt.Errorf("delete drive id %q: %w", path, err)
+	}
+	return nil
+}
+
+// DeleteDriveIDsByPrefix removes all path→driveID mappings under prefix/.
+func (m *MetadataDB) DeleteDriveIDsByPrefix(prefix string) error {
+	_, err := m.db.Exec(`DELETE FROM drive_path_ids WHERE path LIKE ?`, prefix+"/%")
+	if err != nil {
+		return fmt.Errorf("delete drive ids prefix %q: %w", prefix, err)
+	}
+	return nil
 }
