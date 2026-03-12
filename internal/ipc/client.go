@@ -44,8 +44,15 @@ func (c *Client) Status() (StatusResponse, error) {
 		}
 		return StatusResponse{}, fmt.Errorf("ipc: connection closed")
 	}
+	raw := c.scan.Bytes()
+	var errEnv struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(raw, &errEnv) == nil && errEnv.Error != "" {
+		return StatusResponse{}, fmt.Errorf("ipc: status: %s", errEnv.Error)
+	}
 	var resp StatusResponse
-	if err := json.Unmarshal(c.scan.Bytes(), &resp); err != nil {
+	if err := json.Unmarshal(raw, &resp); err != nil {
 		return StatusResponse{}, fmt.Errorf("ipc: decode status response: %w", err)
 	}
 	return resp, nil

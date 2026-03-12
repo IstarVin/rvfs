@@ -38,7 +38,12 @@ CREATE TABLE IF NOT EXISTS mounts (
 
 // OpenMountRegistry opens (or creates) the mount registry database.
 func OpenMountRegistry() (*MountRegistry, error) {
-	regPath := MountRegPath()
+	return openMountRegistryAt(MountRegPath())
+}
+
+// openMountRegistryAt opens (or creates) the mount registry database at the
+// given path. The directory is created if it does not exist.
+func openMountRegistryAt(regPath string) (*MountRegistry, error) {
 	if err := os.MkdirAll(filepath.Dir(regPath), 0700); err != nil {
 		return nil, fmt.Errorf("mountreg: mkdir: %w", err)
 	}
