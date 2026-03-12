@@ -157,9 +157,15 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon)
 	engine.Start()
 
-	// Do initial pull to populate the root directory listing.
-	if err := engine.PullOnce(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: initial pull failed: %v\n", err)
+	// Do an initial pull only when the local metadata DB is empty.
+	// If data is already present, the background sync engine will handle
+	// any remote changes without blocking the mount.
+	if hasData, err := cl.DB().HasFiles(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: checking cache state failed: %v\n", err)
+	} else if !hasData {
+		if err := engine.PullOnce(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: initial pull failed: %v\n", err)
+		}
 	}
 
 	label := remoteName + ":" + remotePath

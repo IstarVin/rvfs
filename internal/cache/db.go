@@ -85,6 +85,17 @@ func (m *MetadataDB) Close() error {
 	return m.db.Close()
 }
 
+// HasFiles reports whether the files table contains at least one row.
+// It is used on startup to decide whether an initial remote pull is needed.
+func (m *MetadataDB) HasFiles() (bool, error) {
+	var n int
+	err := m.db.QueryRow(`SELECT COUNT(*) FROM files LIMIT 1`).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("has files: %w", err)
+	}
+	return n > 0, nil
+}
+
 func applySchema(db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS files (
