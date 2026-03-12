@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/remote"
 )
 
@@ -31,16 +32,19 @@ const (
 type Manager struct {
 	adapter remote.RemoteAdapter
 	cache   *cache.CacheLayer
+	monitor *connectivity.Monitor // may be nil
 
 	mu        sync.Mutex
 	downloads map[string]*Download
 }
 
-// NewManager creates a Download Manager.
-func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer) *Manager {
+// NewManager creates a Download Manager. monitor may be nil; when non-nil,
+// any active download is cancelled automatically when connectivity is lost.
+func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer, monitor *connectivity.Monitor) *Manager {
 	return &Manager{
 		adapter:   adapter,
 		cache:     cl,
+		monitor:   monitor,
 		downloads: make(map[string]*Download),
 	}
 }
@@ -65,6 +69,11 @@ type Download struct {
 	// Periodic persistence state.
 	lastPersist      time.Time
 	bytesSincePersit int64
+
+	// finishedCh is closed (once) when the download completes or is cancelled.
+	// Used to let the offline-watcher goroutine exit cleanly.
+	finishedCh   chan struct{}
+	finishedOnce sync.Once
 }
 
 // goroutineInfo tracks a running download goroutine.
@@ -102,6 +111,7 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 		goroutines:  make(map[int64]*goroutineInfo),
 		mgr:         m,
 		lastPersist: time.Now(),
+		finishedCh:  make(chan struct{}),
 	}
 	dl.cond = sync.NewCond(&dl.mu)
 
@@ -148,8 +158,9 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 	return dl, readFile, nil
 }
 
-// WaitForRange blocks until [offset, offset+size) is available, or returns
-// an error if the download fails.
+// WaitForRange blocks until [offset, offset+size) is available in the cache,
+// or returns an error if the download has been cancelled or has failed.
+// If the download for path is no longer tracked, it returns nil (already done).
 func (m *Manager) WaitForRange(path string, offset, size int64) error {
 	m.mu.Lock()
 	dl, ok := m.downloads[path]
@@ -354,7 +365,7 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 
 			// Periodically persist CachedRanges to DB for crash recovery.
 			if dl.bytesSincePersit >= persistBytes || time.Since(dl.lastPersist) >= persistInterval {
-				dl.persistRangesLocked()
+				dl.persistRangesLocked(cache.StateDownloading)
 			}
 
 			// Stop if the next chunk is already downloaded (another
@@ -383,9 +394,9 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 	}
 }
 
-// persistRangesLocked writes the current CachedRanges to the DB.
-// Must be called with dl.mu held.
-func (dl *Download) persistRangesLocked() {
+// persistRangesLocked writes the current CachedRanges to the DB with the
+// given target state. Must be called with dl.mu held.
+func (dl *Download) persistRangesLocked(state cache.FileState) {
 	rangesJSON, _ := dl.rangeSet.MarshalJSON()
 	dl.lastPersist = time.Now()
 	dl.bytesSincePersit = 0
@@ -395,13 +406,20 @@ func (dl *Download) persistRangesLocked() {
 		entry, err := dl.mgr.cache.Stat(dl.path)
 		if err == nil && entry != nil {
 			entry.CachedRanges = string(rangesJSON)
-			entry.State = cache.StateDownloading
+			entry.State = state
 			_ = dl.mgr.cache.DB().PutFile(entry)
 		}
 	}()
 }
 
+func (dl *Download) closeFinished() {
+	dl.finishedOnce.Do(func() { close(dl.finishedCh) })
+}
+
 func (dl *Download) finish() {
+	// Signal the offline-watcher goroutine (if any) to exit before cleanup.
+	dl.closeFinished()
+
 	dl.cacheFile.Close()
 
 	rangesJSON, _ := dl.rangeSet.MarshalJSON()
@@ -418,16 +436,31 @@ func (dl *Download) finish() {
 }
 
 func (dl *Download) cancel() {
+	// Signal the offline-watcher goroutine (if any) to exit.
+	dl.closeFinished()
+
 	dl.mu.Lock()
 	for _, gi := range dl.goroutines {
 		gi.cancel()
 	}
-	dl.err = fmt.Errorf("download cancelled")
+	if dl.err == nil {
+		dl.err = fmt.Errorf("download cancelled")
+	}
 	dl.cond.Broadcast()
 
-	// Persist ranges before closing so partial progress is saved.
-	dl.persistRangesLocked()
+	// Persist partial ranges and transition the DB state to StateEvicted so
+	// the next Open() after reconnection resumes cleanly.
+	dl.persistRangesLocked(cache.StateEvicted)
 	dl.mu.Unlock()
 
 	dl.cacheFile.Close()
+}
+
+// WaitForRange blocks until [offset, offset+size) is available in the cache,
+// or returns an error if the download has been cancelled. This method uses
+// the Download directly rather than a path lookup in the manager, so it
+// remains correct even after the download has been removed from the manager's
+// active-download map (e.g. during an OFFLINE transition).
+func (dl *Download) WaitForRange(offset, size int64) error {
+	return dl.waitForRange(offset, size)
 }

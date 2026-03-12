@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/download"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -18,7 +19,8 @@ import (
 // RootState holds shared state for all nodes in the FUSE tree.
 type RootState struct {
 	cache       *cache.CacheLayer
-	downloadMgr *download.Manager // nil when using backing-dir mode
+	downloadMgr *download.Manager     // nil when using backing-dir mode
+	monitor     *connectivity.Monitor // nil when using backing-dir mode
 }
 
 // FuseNode is a node in the FUSE filesystem tree.
@@ -250,6 +252,13 @@ func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 			return nil, 0, syscall.EIO
 		}
 		if entry != nil && (entry.State == cache.StateEvicted || entry.State == cache.StateDownloading) {
+			// Refuse to start a new download while offline — the file is not
+			// locally available and we cannot reach the remote.
+			if entry.State == cache.StateEvicted &&
+				n.root.monitor != nil &&
+				n.root.monitor.State() == connectivity.StateOffline {
+				return nil, 0, syscall.ENOENT
+			}
 			dl, readFile, err := n.root.downloadMgr.Start(n.rel, entry.Size)
 			if err != nil {
 				return nil, 0, syscall.EIO
@@ -413,7 +422,10 @@ var _ fs.FileReader = (*downloadFileHandle)(nil)
 var _ fs.FileReleaser = (*downloadFileHandle)(nil)
 
 func (dh *downloadFileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadResult, syscall.Errno) {
-	if err := dh.mgr.WaitForRange(dh.path, off, int64(len(dest))); err != nil {
+	// Use the Download reference directly so range checks remain correct
+	// even after the download has been removed from the manager's map
+	// (e.g. following an OFFLINE cancellation).
+	if err := dh.dl.WaitForRange(off, int64(len(dest))); err != nil {
 		return nil, syscall.EIO
 	}
 	n, err := dh.f.ReadAt(dest, off)

@@ -3,9 +3,11 @@ package sync
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/remote"
 )
 
@@ -17,21 +19,33 @@ type Engine struct {
 	interval time.Duration
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	// Connectivity-aware pause/resume. monitor may be nil (local / no monitor).
+	monitor       *connectivity.Monitor
+	paused        atomic.Bool
+	connWatchDone chan struct{} // closed when watchConn exits; nil if no monitor
 }
 
-// NewEngine creates a sync engine.
-func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time.Duration) *Engine {
+// NewEngine creates a sync engine. monitor may be nil for local mounts or
+// when no connectivity tracking is desired.
+func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time.Duration, monitor *connectivity.Monitor) *Engine {
 	return &Engine{
 		adapter:  adapter,
 		cache:    cl,
 		interval: interval,
+		monitor:  monitor,
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
 }
 
-// Start launches the background sync loop.
+// Start launches the background sync loop (and the connectivity watcher if a
+// monitor was provided).
 func (e *Engine) Start() {
+	if e.monitor != nil {
+		e.connWatchDone = make(chan struct{})
+		go e.watchConn()
+	}
 	go e.loop()
 }
 
@@ -39,6 +53,9 @@ func (e *Engine) Start() {
 func (e *Engine) Stop() {
 	close(e.stopCh)
 	<-e.doneCh
+	if e.connWatchDone != nil {
+		<-e.connWatchDone
+	}
 }
 
 func (e *Engine) loop() {
@@ -52,9 +69,42 @@ func (e *Engine) loop() {
 		case <-e.stopCh:
 			return
 		case <-ticker.C:
+			if e.paused.Load() {
+				continue
+			}
 			e.uploadDirty()
 			e.processPendingOps()
 			e.pull()
+		}
+	}
+}
+
+// watchConn subscribes to monitor state transitions and pauses/resumes the
+// sync loop accordingly. On RECONNECTING it drains the dirty queue before
+// calling NotifyQueueDrained so the monitor can transition to ONLINE.
+func (e *Engine) watchConn() {
+	defer close(e.connWatchDone)
+
+	sub := e.monitor.Subscribe()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case s, ok := <-sub:
+			if !ok {
+				return
+			}
+			switch s {
+			case connectivity.StateOffline:
+				e.paused.Store(true)
+			case connectivity.StateReconnecting:
+				// Drain dirty queue while still paused, then let the monitor know
+				// and resume normal polling.
+				e.uploadDirty()
+				e.processPendingOps()
+				e.monitor.NotifyQueueDrained()
+				e.paused.Store(false)
+			}
 		}
 	}
 }

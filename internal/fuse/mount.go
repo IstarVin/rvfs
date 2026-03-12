@@ -6,6 +6,7 @@ import (
 	"syscall"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/download"
 	"github.com/IstarVin/rvfs/internal/remote"
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -20,6 +21,10 @@ type MountOptions struct {
 	Name string
 	// Adapter is the remote storage backend. Nil for backing-dir mode.
 	Adapter remote.RemoteAdapter
+	// Monitor is the connectivity monitor. Nil for backing-dir mode.
+	// When non-nil, downloads are cancelled on OFFLINE and Open returns
+	// ENOENT for uncached files while offline.
+	Monitor *connectivity.Monitor
 }
 
 // Mount creates a CacheLayer for the given remote-id, mounts it at mountpoint,
@@ -40,7 +45,10 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 
 	// If a remote adapter is provided, create a Download Manager.
 	if opts.Adapter != nil {
-		rootState.downloadMgr = download.NewManager(opts.Adapter, cl)
+		rootState.downloadMgr = download.NewManager(opts.Adapter, cl, opts.Monitor)
+	}
+	if opts.Monitor != nil {
+		rootState.monitor = opts.Monitor
 	}
 
 	root := &FuseNode{

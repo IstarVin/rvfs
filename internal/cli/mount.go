@@ -9,6 +9,7 @@ import (
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/config"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/fuse"
 	"github.com/IstarVin/rvfs/internal/remote/gdrive"
 	syncpkg "github.com/IstarVin/rvfs/internal/sync"
@@ -16,9 +17,10 @@ import (
 )
 
 var (
-	mountDebug        bool
-	mountCacheDir     string
-	mountPollInterval time.Duration
+	mountDebug         bool
+	mountCacheDir      string
+	mountPollInterval  time.Duration
+	mountProbeInterval time.Duration
 )
 
 var mountCmd = &cobra.Command{
@@ -123,9 +125,15 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		return fmt.Errorf("probe remote: %w", err)
 	}
 
+	// Start the connectivity monitor.
+	mon := connectivity.New(adapter, mountProbeInterval, 3)
+	mon.Start()
+	defer mon.Stop()
+
 	_, server, err := fuse.Mount(cacheDir, remoteID, mountpoint, fuse.MountOptions{
 		Debug:   mountDebug,
 		Adapter: adapter,
+		Monitor: mon,
 	})
 	if err != nil {
 		cl.Close()
@@ -133,7 +141,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	}
 
 	// Start sync engine.
-	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval)
+	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon)
 	engine.Start()
 
 	// Do initial pull to populate the root directory listing.
@@ -153,4 +161,5 @@ func init() {
 	mountCmd.Flags().BoolVar(&mountDebug, "debug", false, "Enable FUSE debug logging")
 	mountCmd.Flags().StringVar(&mountCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
 	mountCmd.Flags().DurationVar(&mountPollInterval, "poll-interval", 30*time.Second, "Remote polling interval")
+	mountCmd.Flags().DurationVar(&mountProbeInterval, "probe-interval", 5*time.Second, "Connectivity probe interval")
 }
