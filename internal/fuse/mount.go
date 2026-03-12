@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/connectivity"
@@ -25,6 +26,15 @@ type MountOptions struct {
 	// When non-nil, downloads are cancelled on OFFLINE and Open returns
 	// ENOENT for uncached files while offline.
 	Monitor *connectivity.Monitor
+	// ReadAhead is the maximum number of bytes the sequential download
+	// goroutine may get ahead of the reader's current position.
+	// 0 means unlimited (download as fast as possible).
+	ReadAhead int64
+	// IdleTimeout stops the sequential download goroutine when it has been
+	// paused at the read-ahead limit for this duration with no reads.
+	// The goroutine restarts automatically on the next read.
+	// 0 means wait indefinitely. Only meaningful when ReadAhead > 0.
+	IdleTimeout time.Duration
 }
 
 // Mount creates a CacheLayer for the given remote-id, mounts it at mountpoint,
@@ -45,7 +55,10 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 
 	// If a remote adapter is provided, create a Download Manager.
 	if opts.Adapter != nil {
-		rootState.downloadMgr = download.NewManager(opts.Adapter, cl, opts.Monitor)
+		rootState.downloadMgr = download.NewManager(opts.Adapter, cl, opts.Monitor, download.ManagerOptions{
+			ReadAhead:   opts.ReadAhead,
+			IdleTimeout: opts.IdleTimeout,
+		})
 	}
 	if opts.Monitor != nil {
 		rootState.monitor = opts.Monitor

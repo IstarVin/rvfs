@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ var (
 	mountPollInterval     time.Duration
 	mountProbeInterval    time.Duration
 	mountRecoveryInterval time.Duration
+	mountReadAhead        int64
+	mountIdleTimeout      time.Duration
 )
 
 var mountCmd = &cobra.Command{
@@ -139,9 +142,11 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	defer mon.Stop()
 
 	_, server, err := fuse.Mount(cacheDir, remoteID, mountpoint, fuse.MountOptions{
-		Debug:   mountDebug,
-		Adapter: adapter,
-		Monitor: mon,
+		Debug:       mountDebug,
+		Adapter:     adapter,
+		Monitor:     mon,
+		ReadAhead:   mountReadAhead,
+		IdleTimeout: mountIdleTimeout,
 	})
 	if err != nil {
 		cl.Close()
@@ -165,10 +170,70 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	return nil
 }
 
+// durationValue is a pflag.Value that parses Go duration strings
+// case-insensitively, so "3H" is treated the same as "3h".
+type durationValue time.Duration
+
+func (d *durationValue) Set(s string) error {
+	v, err := time.ParseDuration(strings.ToLower(s))
+	if err != nil {
+		return err
+	}
+	*d = durationValue(v)
+	return nil
+}
+func (d *durationValue) Type() string   { return "duration" }
+func (d *durationValue) String() string { return time.Duration(*d).String() }
+
+// byteSizeValue is a pflag.Value that parses byte sizes with optional
+// case-insensitive suffixes: K (kibibytes), M (mebibytes), G (gibibytes).
+// Examples: "256", "4K", "3M", "1G".
+type byteSizeValue int64
+
+func (b *byteSizeValue) Set(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fmt.Errorf("empty byte size")
+	}
+	multiplier := int64(1)
+	numStr := s
+	switch strings.ToUpper(string(s[len(s)-1])) {
+	case "K":
+		multiplier = 1024
+		numStr = s[:len(s)-1]
+	case "M":
+		multiplier = 1024 * 1024
+		numStr = s[:len(s)-1]
+	case "G":
+		multiplier = 1024 * 1024 * 1024
+		numStr = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(numStr), 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid byte size %q", s)
+	}
+	*b = byteSizeValue(n * multiplier)
+	return nil
+}
+func (b *byteSizeValue) Type() string   { return "bytes" }
+func (b *byteSizeValue) String() string { return strconv.FormatInt(int64(*b), 10) }
+
 func init() {
 	mountCmd.Flags().BoolVar(&mountDebug, "debug", false, "Enable FUSE debug logging")
 	mountCmd.Flags().StringVar(&mountCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
-	mountCmd.Flags().DurationVar(&mountPollInterval, "poll-interval", 30*time.Second, "Remote polling interval")
-	mountCmd.Flags().DurationVar(&mountProbeInterval, "probe-interval", 5*time.Second, "Connectivity probe interval")
-	mountCmd.Flags().DurationVar(&mountRecoveryInterval, "recovery-interval", 2*time.Second, "Probe interval while offline (for faster reconnect detection)")
+
+	mountPollInterval = 30 * time.Second
+	mountCmd.Flags().Var((*durationValue)(&mountPollInterval), "poll-interval", "Remote polling interval (e.g. 30s, 5M, 1H)")
+
+	mountProbeInterval = 5 * time.Second
+	mountCmd.Flags().Var((*durationValue)(&mountProbeInterval), "probe-interval", "Connectivity probe interval (e.g. 5s, 1M)")
+
+	mountRecoveryInterval = 2 * time.Second
+	mountCmd.Flags().Var((*durationValue)(&mountRecoveryInterval), "recovery-interval", "Probe interval while offline for faster reconnect detection (e.g. 2s)")
+
+	mountReadAhead = 256 * 1 << 20
+	mountCmd.Flags().Var((*byteSizeValue)(&mountReadAhead), "read-ahead", "Bytes to download ahead of the read position; supports K/M/G suffixes (e.g. 256, 4K, 3M); 0 = unlimited")
+
+	mountIdleTimeout = 5
+	mountCmd.Flags().Var((*durationValue)(&mountIdleTimeout), "idle-timeout", "Stop downloading when paused with no reads for this duration (e.g. 30s, 5M); 0 = wait forever; requires --read-ahead > 0")
 }

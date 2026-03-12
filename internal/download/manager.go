@@ -28,11 +28,30 @@ const (
 	persistBytes = 5 * 1024 * 1024 // 5 MiB
 )
 
+// ManagerOptions configures optional behaviour of the download Manager.
+type ManagerOptions struct {
+	// ReadAhead is the maximum number of bytes the sequential download goroutine
+	// is allowed to get ahead of the furthest position the reader has consumed.
+	// 0 means unlimited — the goroutine downloads as fast as possible (default
+	// behaviour).
+	ReadAhead int64
+
+	// IdleTimeout stops the sequential download goroutine when it has been
+	// paused at the read-ahead limit for this long with no new reads. The
+	// goroutine is automatically restarted from the reader's position on the
+	// next read. 0 means wait indefinitely.
+	// Only meaningful when ReadAhead > 0.
+	IdleTimeout time.Duration
+}
+
 // Manager manages all in-progress remote→cache downloads.
 type Manager struct {
 	adapter remote.RemoteAdapter
 	cache   *cache.CacheLayer
 	monitor *connectivity.Monitor // may be nil
+
+	readAhead   int64         // copy of ManagerOptions.ReadAhead
+	idleTimeout time.Duration // copy of ManagerOptions.IdleTimeout
 
 	mu        sync.Mutex
 	downloads map[string]*Download
@@ -40,12 +59,14 @@ type Manager struct {
 
 // NewManager creates a Download Manager. monitor may be nil; when non-nil,
 // any active download is cancelled automatically when connectivity is lost.
-func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer, monitor *connectivity.Monitor) *Manager {
+func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer, monitor *connectivity.Monitor, opts ManagerOptions) *Manager {
 	m := &Manager{
-		adapter:   adapter,
-		cache:     cl,
-		monitor:   monitor,
-		downloads: make(map[string]*Download),
+		adapter:     adapter,
+		cache:       cl,
+		monitor:     monitor,
+		readAhead:   opts.ReadAhead,
+		idleTimeout: opts.IdleTimeout,
+		downloads:   make(map[string]*Download),
 	}
 	if monitor != nil {
 		go m.watchOffline()
@@ -60,11 +81,12 @@ type Download struct {
 	rangeSet  *RangeSet
 	totalSize int64
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	seqPos int64 // current position of the sequential download goroutine
-	err    error // first fatal error
-	done   bool
+	mu          sync.Mutex
+	cond        *sync.Cond
+	seqPos      int64 // current position of the sequential download goroutine
+	lastReadPos int64 // furthest offset+size the reader has consumed
+	err         error // first fatal error
+	done        bool
 
 	// goroutines maps startOffset → (cancel func, current position).
 	goroutines map[int64]*goroutineInfo
@@ -277,6 +299,15 @@ func (dl *Download) waitForRange(offset, size int64) error {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
 
+	// Track the furthest read position so the sequential download goroutine
+	// can stay within the configured read-ahead limit. Do this before the fast
+	// path so even cache-hit reads keep the goroutine moving forward.
+	if end := offset + size; end > dl.lastReadPos {
+		dl.lastReadPos = end
+	}
+	// Broadcast to wake any goroutine currently paused at the read-ahead limit.
+	dl.cond.Broadcast()
+
 	// Fast path: already available.
 	if dl.rangeSet.Contains(offset, size) {
 		return nil
@@ -292,10 +323,15 @@ func (dl *Download) waitForRange(offset, size int64) error {
 		return nil
 	}
 
-	// Spawn an on-demand goroutine if no goroutine is close to the
-	// requested offset. This enables immediate streaming from any
-	// position instead of waiting for the sequential goroutine.
-	if !dl.hasGoroutineNear(offset) {
+	// If all goroutines have exited (e.g. the sequential goroutine stopped due
+	// to the idle timeout), restart a sequential goroutine from this offset so
+	// prefetching resumes automatically when the reader continues.
+	if len(dl.goroutines) == 0 {
+		dl.spawnGoroutine(offset, true)
+	} else if !dl.hasGoroutineNear(offset) {
+		// Spawn an on-demand goroutine if no goroutine is close to the
+		// requested offset. This enables immediate streaming from any
+		// position instead of waiting for the sequential goroutine.
 		dl.spawnGoroutine(offset, false)
 	}
 
@@ -431,6 +467,47 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 			if nextCovered && !isSequential {
 				pr.Close()
 				return
+			}
+
+			// Read-ahead throttle (sequential goroutine only).
+			// When the sequential goroutine is more than readAhead bytes
+			// ahead of the furthest position the reader has consumed, pause
+			// here until the reader catches up. This stops network I/O while
+			// the user has paused playback.
+			if isSequential && dl.mgr.readAhead > 0 {
+				dl.mu.Lock()
+				pausedSince := time.Now()
+				for pos > dl.lastReadPos+dl.mgr.readAhead && !dl.done && dl.err == nil {
+					// If an idle timeout is configured and has elapsed while
+					// we've been waiting, stop downloading entirely. The
+					// goroutine will be restarted automatically by the next
+					// waitForRange call (e.g. the player resuming).
+					if dl.mgr.idleTimeout > 0 && time.Since(pausedSince) >= dl.mgr.idleTimeout {
+						dl.mu.Unlock()
+						pr.Close()
+						return
+					}
+					if dl.mgr.idleTimeout > 0 {
+						// Schedule a short wake-up so we can re-evaluate the
+						// idle timeout even when no read Broadcasts occur.
+						timer := time.AfterFunc(100*time.Millisecond, func() {
+							dl.mu.Lock()
+							dl.cond.Broadcast()
+							dl.mu.Unlock()
+						})
+						dl.cond.Wait()
+						timer.Stop()
+					} else {
+						// No idle timeout: block until a read unblocks us.
+						dl.cond.Wait()
+					}
+				}
+				shouldStop := dl.done || dl.err != nil
+				dl.mu.Unlock()
+				if shouldStop {
+					pr.Close()
+					return
+				}
 			}
 		}
 
