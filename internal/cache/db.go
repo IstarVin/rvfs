@@ -2,11 +2,19 @@ package cache
 
 import (
 	"database/sql"
+	"embed"
 	"fmt"
+	"io/fs"
+	"path"
+	"sort"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 // FileState represents the synchronisation state of a cached file.
 type FileState string
@@ -97,45 +105,30 @@ func (m *MetadataDB) HasFiles() (bool, error) {
 }
 
 func applySchema(db *sql.DB) error {
-	const schema = `
-CREATE TABLE IF NOT EXISTS files (
-	path          TEXT PRIMARY KEY,
-	is_dir        INTEGER NOT NULL DEFAULT 0,
-	size          INTEGER NOT NULL DEFAULT 0,
-	mode          INTEGER NOT NULL DEFAULT 0,
-	remote_mtime  INTEGER NOT NULL DEFAULT 0,
-	local_mtime   INTEGER NOT NULL DEFAULT 0,
-	cache_path    TEXT    NOT NULL DEFAULT '',
-	state         TEXT    NOT NULL DEFAULT 'clean',
-	cached_ranges TEXT    NOT NULL DEFAULT '[]',
-	sync_error    TEXT    NOT NULL DEFAULT '',
-	retry_after   INTEGER NOT NULL DEFAULT 0,
-	checksum      TEXT    NOT NULL DEFAULT ''
-);
-
-CREATE INDEX IF NOT EXISTS idx_files_state ON files(state);
-CREATE INDEX IF NOT EXISTS idx_files_dir   ON files(path) WHERE is_dir = 1;
-
-CREATE TABLE IF NOT EXISTS pending_ops (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	op         TEXT    NOT NULL,
-	path       TEXT    NOT NULL,
-	dest_path  TEXT    NOT NULL DEFAULT '',
-	queued_at  INTEGER NOT NULL,
-	attempts   INTEGER NOT NULL DEFAULT 0,
-	last_error TEXT    NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS drive_path_ids (
-	path      TEXT PRIMARY KEY,
-	drive_id  TEXT    NOT NULL,
-	etag      TEXT    NOT NULL DEFAULT '',
-	last_seen INTEGER NOT NULL DEFAULT 0
-);
-`
-	_, err := db.Exec(schema)
+	// Read all migration files from the embedded migrations directory, sorted by name
+	files, err := fs.Glob(migrationsFS, "migrations/*.sql")
 	if err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+		return fmt.Errorf("glob migrations: %w", err)
+	}
+	sort.Strings(files)
+
+	for _, filename := range files {
+		content, err := fs.ReadFile(migrationsFS, filename)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", filename, err)
+		}
+
+		// Split by semicolon to handle multiple statements per file
+		statements := strings.Split(string(content), ";")
+		for _, stmt := range statements {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			if _, err := db.Exec(stmt); err != nil {
+				return fmt.Errorf("apply migration %s: %w", path.Base(filename), err)
+			}
+		}
 	}
 	return nil
 }
@@ -420,4 +413,96 @@ func (m *MetadataDB) DeleteDriveIDsByPrefix(prefix string) error {
 		return fmt.Errorf("delete drive ids prefix %q: %w", prefix, err)
 	}
 	return nil
+}
+
+// ---------- conflicts CRUD ----------
+
+// ConflictEntry mirrors one row in the conflicts table.
+type ConflictEntry struct {
+	ID          int64
+	Path        string
+	LocalMtime  int64
+	RemoteMtime int64
+	DetectedAt  int64
+}
+
+// AddConflict inserts or updates a conflict record for path.
+func (m *MetadataDB) AddConflict(path string, localMtime, remoteMtime int64) error {
+	now := time.Now().Unix()
+	_, err := m.db.Exec(`
+		INSERT INTO conflicts (path, local_mtime, remote_mtime, detected_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			local_mtime  = excluded.local_mtime,
+			remote_mtime = excluded.remote_mtime,
+			detected_at  = excluded.detected_at`,
+		path, localMtime, remoteMtime, now)
+	if err != nil {
+		return fmt.Errorf("add conflict %q: %w", path, err)
+	}
+	return nil
+}
+
+// RemoveConflict deletes a conflict record by ID.
+func (m *MetadataDB) RemoveConflict(id int64) error {
+	_, err := m.db.Exec(`DELETE FROM conflicts WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("remove conflict %d: %w", id, err)
+	}
+	return nil
+}
+
+// RemoveConflictByPath deletes the conflict record for path.
+func (m *MetadataDB) RemoveConflictByPath(path string) error {
+	_, err := m.db.Exec(`DELETE FROM conflicts WHERE path = ?`, path)
+	if err != nil {
+		return fmt.Errorf("remove conflict %q: %w", path, err)
+	}
+	return nil
+}
+
+// RemoveAllConflicts deletes all conflict records.
+func (m *MetadataDB) RemoveAllConflicts() error {
+	_, err := m.db.Exec(`DELETE FROM conflicts`)
+	if err != nil {
+		return fmt.Errorf("remove all conflicts: %w", err)
+	}
+	return nil
+}
+
+// ListConflicts returns all conflict records ordered by detected_at.
+func (m *MetadataDB) ListConflicts() ([]*ConflictEntry, error) {
+	rows, err := m.db.Query(`
+		SELECT id, path, local_mtime, remote_mtime, detected_at
+		FROM conflicts ORDER BY detected_at`)
+	if err != nil {
+		return nil, fmt.Errorf("list conflicts: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*ConflictEntry
+	for rows.Next() {
+		e := &ConflictEntry{}
+		if err := rows.Scan(&e.ID, &e.Path, &e.LocalMtime, &e.RemoteMtime, &e.DetectedAt); err != nil {
+			return nil, fmt.Errorf("scan conflict: %w", err)
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// GetConflict returns the conflict record with the given ID, or nil if not found.
+func (m *MetadataDB) GetConflict(id int64) (*ConflictEntry, error) {
+	e := &ConflictEntry{}
+	err := m.db.QueryRow(`
+		SELECT id, path, local_mtime, remote_mtime, detected_at
+		FROM conflicts WHERE id = ?`, id).Scan(
+		&e.ID, &e.Path, &e.LocalMtime, &e.RemoteMtime, &e.DetectedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get conflict %d: %w", id, err)
+	}
+	return e, nil
 }

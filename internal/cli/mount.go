@@ -25,6 +25,7 @@ var (
 	mountRecoveryInterval time.Duration
 	mountReadAhead        int64
 	mountIdleTimeout      time.Duration
+	mountConflictStrategy string
 )
 
 var mountCmd = &cobra.Command{
@@ -50,6 +51,10 @@ For a configured remote:
 				return fmt.Errorf("home dir: %w", err)
 			}
 			cacheDir = filepath.Join(home, ".cache", "rvfs")
+		}
+
+		if !syncpkg.ValidConflictStrategy(mountConflictStrategy) {
+			return fmt.Errorf("invalid --conflict %q: must be one of both, local-wins, remote-wins, manual", mountConflictStrategy)
 		}
 
 		// Determine if source is a remote (contains ':') or a local path.
@@ -154,7 +159,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	}
 
 	// Start sync engine.
-	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon)
+	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon, syncpkg.ConflictStrategy(mountConflictStrategy))
 	engine.Start()
 
 	// Do an initial pull only when the local metadata DB is empty.
@@ -242,4 +247,7 @@ func init() {
 
 	mountIdleTimeout = 5
 	mountCmd.Flags().Var((*durationValue)(&mountIdleTimeout), "idle-timeout", "Stop downloading when paused with no reads for this duration (e.g. 30s, 5M); 0 = wait forever; requires --read-ahead > 0")
+
+	mountConflictStrategy = "both"
+	mountCmd.Flags().StringVar(&mountConflictStrategy, "conflict", "both", "Conflict resolution strategy: both, local-wins, remote-wins, manual")
 }

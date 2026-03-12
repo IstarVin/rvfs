@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS conflicts (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	path         TEXT    NOT NULL UNIQUE,
+	local_mtime  INTEGER NOT NULL DEFAULT 0,
+	remote_mtime INTEGER NOT NULL DEFAULT 0,
+	detected_at  INTEGER NOT NULL DEFAULT 0
+);

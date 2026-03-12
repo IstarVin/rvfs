@@ -24,12 +24,20 @@ type Engine struct {
 	monitor       *connectivity.Monitor
 	paused        atomic.Bool
 	connWatchDone chan struct{} // closed when watchConn exits; nil if no monitor
+
+	// resolver applies the configured conflict strategy. nil when no adapter.
+	resolver *Resolver
 }
 
 // NewEngine creates a sync engine. monitor may be nil for local mounts or
-// when no connectivity tracking is desired.
-func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time.Duration, monitor *connectivity.Monitor) *Engine {
-	return &Engine{
+// when no connectivity tracking is desired. strategy controls conflict
+// resolution behaviour (see ConflictStrategy constants); if empty, StrategyBoth
+// is used.
+func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time.Duration, monitor *connectivity.Monitor, strategy ConflictStrategy) *Engine {
+	if strategy == "" {
+		strategy = StrategyBoth
+	}
+	e := &Engine{
 		adapter:  adapter,
 		cache:    cl,
 		interval: interval,
@@ -37,6 +45,10 @@ func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
+	if adapter != nil {
+		e.resolver = NewResolver(strategy, cl, adapter)
+	}
+	return e
 }
 
 // Start launches the background sync loop (and the connectivity watcher if a
@@ -132,6 +144,19 @@ func (e *Engine) uploadDirty() {
 }
 
 func (e *Engine) uploadFile(entry *cache.FileEntry) {
+	// Before uploading check whether the remote has been modified since our
+	// last sync point. If so, delegate to the conflict resolver instead of
+	// overwriting the remote change. Only do this for files that have a known
+	// remote mtime (i.e. were previously synced); brand-new local files
+	// (RemoteMtime==0) are always safe to upload.
+	if e.resolver != nil && entry.RemoteMtime > 0 {
+		remoteStat, statErr := e.adapter.Stat(entry.Path)
+		if statErr == nil && remoteStat.Mtime.Unix() > entry.RemoteMtime {
+			_ = e.resolver.Resolve(entry, remoteStat)
+			return
+		}
+	}
+
 	// Set state to syncing.
 	if err := e.cache.DB().SetState(entry.Path, cache.StateSyncing); err != nil {
 		return
@@ -260,10 +285,16 @@ func (e *Engine) pullDir(dirPath string) error {
 				os.Remove(e.cache.DiskPath(rf.Path))
 
 			case cache.StateDirty, cache.StateSyncing:
-				// Conflict — Phase 5 will handle resolution.
-				existing.State = cache.StateConflict
-				existing.RemoteMtime = remoteMtime
-				_ = e.cache.DB().PutFile(existing)
+				// Conflict: remote has changed while we have local edits.
+				// Delegate to the resolver (strategy = both/local-wins/…).
+				if e.resolver != nil {
+					existing.RemoteMtime = remoteMtime
+					_ = e.resolver.Resolve(existing, rf)
+				} else {
+					existing.State = cache.StateConflict
+					existing.RemoteMtime = remoteMtime
+					_ = e.cache.DB().PutFile(existing)
+				}
 			}
 		}
 	}
