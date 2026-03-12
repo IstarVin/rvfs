@@ -64,8 +64,7 @@ func showAllStatus() error {
 	_ = getCacheDir()
 
 	// Enumerate *.sock files to find active mounts.
-	sockDir := ipc.SockPath("__placeholder__")
-	sockDir = filepath.Dir(sockDir)
+	sockDir := ipc.SockDir()
 
 	ents, err := os.ReadDir(sockDir)
 	if err != nil || len(ents) == 0 {

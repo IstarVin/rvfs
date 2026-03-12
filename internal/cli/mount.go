@@ -170,6 +170,25 @@ func mountLocal(backingDir, mountpoint, cacheDir string) error {
 }
 
 func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
+	absMountpoint, err := filepath.Abs(mountpoint)
+	if err != nil {
+		return fmt.Errorf("resolve mountpoint: %w", err)
+	}
+
+	// Check for duplicate (same remote → same mountpoint) via the mount registry.
+	reg, regErr := ipc.OpenMountRegistry()
+	if regErr != nil {
+		slog.Warn("mount registry unavailable", "err", regErr)
+		reg = nil
+	}
+	if reg != nil {
+		defer reg.Close()
+		if entry, alive, _ := reg.Lookup(absMountpoint); alive {
+			return fmt.Errorf("mountpoint %q is already in use (source: %s, pid: %d)",
+				absMountpoint, entry.Source, entry.PID)
+		}
+	}
+
 	cfgPath := config.DefaultPath()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -254,10 +273,10 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 
 	// Start IPC server so status/sync commands can communicate with us.
 	source := remoteName + ":" + remotePath
-	sockPath := ipc.SockPath(remoteID)
+	sockPath := ipc.MountSockPath(remoteName, absMountpoint)
 	srv := ipc.NewServer(sockPath, &mountHandler{
 		source:     source,
-		mountpoint: mountpoint,
+		mountpoint: absMountpoint,
 		cl:         cl,
 		engine:     engine,
 		mon:        mon,
@@ -267,6 +286,20 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		slog.Warn("IPC server unavailable", "err", listenErr)
 	} else {
 		defer srv.Close()
+		if reg != nil {
+			if regErr := reg.Register(ipc.MountEntry{
+				Mountpoint: absMountpoint,
+				Source:     source,
+				RemoteName: remoteName,
+				SockPath:   sockPath,
+				PID:        os.Getpid(),
+				MountedAt:  time.Now().Unix(),
+			}); regErr != nil {
+				slog.Warn("mount registry: register failed", "err", regErr)
+			} else {
+				defer reg.Deregister(absMountpoint)
+			}
+		}
 	}
 
 	// Start LRU evictor.
@@ -367,7 +400,6 @@ func handleServiceInstall(source, mountpoint string, _ []string, cmd *cobra.Comm
 	}
 	return fmt.Errorf("--install-service: neither systemctl nor launchctl found on PATH")
 }
-
 
 func (h *mountHandler) HandleStatus() (ipc.StatusResponse, error) {
 	pending, _ := h.cl.DB().CountPendingOps()
