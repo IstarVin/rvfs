@@ -110,7 +110,21 @@ func printStatus(r ipc.StatusResponse) {
 	}
 
 	cacheStr := "—"
-	if r.CacheTotal > 0 {
+	if r.CacheMinFreeSpace > 0 && r.CacheFSFree > 0 {
+		avail := r.CacheFSFree - r.CacheMinFreeSpace
+		if avail < 0 {
+			avail = 0
+		}
+		if r.CacheTotal > 0 {
+			// Cap available by the configured max cache size minus what's used.
+			remaining := r.CacheTotal - r.CacheUsed
+			if remaining < avail {
+				avail = remaining
+			}
+		}
+		cacheStr = fmt.Sprintf("%s used, %s available to fill",
+			humanBytes(r.CacheUsed), humanBytes(avail))
+	} else if r.CacheTotal > 0 {
 		pct := float64(r.CacheUsed) / float64(r.CacheTotal) * 100
 		cacheStr = fmt.Sprintf("%s / %s (%.0f%%)",
 			humanBytes(r.CacheUsed), humanBytes(r.CacheTotal), pct)

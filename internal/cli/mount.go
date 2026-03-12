@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
@@ -293,12 +294,14 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	source := remoteName + ":" + remotePath
 	sockPath := ipc.MountSockPath(remoteName, absMountpoint)
 	srv := ipc.NewServer(sockPath, &mountHandler{
-		source:     source,
-		mountpoint: absMountpoint,
-		cl:         cl,
-		engine:     engine,
-		mon:        mon,
-		maxSize:    mountCacheSize,
+		source:       source,
+		mountpoint:   absMountpoint,
+		cl:           cl,
+		engine:       engine,
+		mon:          mon,
+		maxSize:      mountCacheSize,
+		minFreeSpace: mountCacheMinFreeSpace,
+		cacheDir:     cacheDir,
 	})
 	if listenErr := srv.Listen(); listenErr != nil {
 		slog.Warn("IPC server unavailable", "err", listenErr)
@@ -373,12 +376,14 @@ func recoverDownloads(cl *cache.CacheLayer, adapter remote.RemoteAdapter) {
 
 // mountHandler implements ipc.Handler for a running mount process.
 type mountHandler struct {
-	source     string
-	mountpoint string
-	cl         *cache.CacheLayer
-	engine     *syncpkg.Engine
-	mon        *connectivity.Monitor
-	maxSize    int64
+	source       string
+	mountpoint   string
+	cl           *cache.CacheLayer
+	engine       *syncpkg.Engine
+	mon          *connectivity.Monitor
+	maxSize      int64
+	minFreeSpace int64
+	cacheDir     string
 }
 
 // handleServiceInstall handles --install-service and --uninstall-service. It
@@ -424,14 +429,25 @@ func (h *mountHandler) HandleStatus() (ipc.StatusResponse, error) {
 	conflicts, _ := h.cl.DB().CountConflicts()
 	used, _ := cache.DirSize(h.cl.FilesDir())
 	online := h.mon != nil && h.mon.State() == connectivity.StateOnline
+
+	var fsFree int64
+	if h.minFreeSpace > 0 && h.cacheDir != "" {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(h.cacheDir, &st); err == nil {
+			fsFree = int64(st.Bavail) * st.Bsize
+		}
+	}
+
 	return ipc.StatusResponse{
-		Source:     h.source,
-		Mountpoint: h.mountpoint,
-		Online:     online,
-		CacheUsed:  used,
-		CacheTotal: h.maxSize,
-		Pending:    pending,
-		Conflicts:  conflicts,
+		Source:            h.source,
+		Mountpoint:        h.mountpoint,
+		Online:            online,
+		CacheUsed:         used,
+		CacheTotal:        h.maxSize,
+		CacheMinFreeSpace: h.minFreeSpace,
+		CacheFSFree:       fsFree,
+		Pending:           pending,
+		Conflicts:         conflicts,
 	}, nil
 }
 

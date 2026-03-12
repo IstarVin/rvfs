@@ -25,6 +25,10 @@ type StatusResponse struct {
 	CacheUsed int64 `json:"cache_used"`
 	// CacheTotal is the configured max cache size (0 = unlimited).
 	CacheTotal int64 `json:"cache_total"`
+	// CacheMinFreeSpace is the configured minimum free space threshold (0 = disabled).
+	CacheMinFreeSpace int64 `json:"cache_min_free_space,omitempty"`
+	// CacheFSFree is the current free bytes on the filesystem containing the cache dir.
+	CacheFSFree int64 `json:"cache_fs_free,omitempty"`
 	// Pending is the number of rows in the pending_ops table.
 	Pending int `json:"pending"`
 	// Conflicts is the number of rows in the conflicts table.
