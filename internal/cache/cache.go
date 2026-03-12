@@ -85,6 +85,8 @@ func (c *CacheLayer) Read(rel string, dest []byte, off int64) (int, error) {
 	if err == io.EOF {
 		err = nil
 	}
+	// Best-effort last-access tracking for LRU eviction.
+	_ = c.db.UpdateLastAccess(rel, time.Now().Unix())
 	return n, err
 }
 
@@ -551,4 +553,10 @@ func (c *CacheLayer) OpenOrCreate(rel string, size int64) (*os.File, error) {
 // Exported for use by the download manager.
 func (c *CacheLayer) DiskPath(rel string) string {
 	return c.diskPath(rel)
+}
+
+// FilesDir returns the absolute path to the files/ subdirectory of the cache.
+// Used by the evictor to compute total disk usage.
+func (c *CacheLayer) FilesDir() string {
+	return c.filesDir
 }

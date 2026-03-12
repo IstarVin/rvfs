@@ -41,4 +41,11 @@ func init() {
 	rootCmd.AddCommand(remoteCmd)
 	rootCmd.AddCommand(conflictsCmd)
 	rootCmd.AddCommand(resolveCmd)
+	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(queueCmd)
+	rootCmd.AddCommand(syncCmd)
+	rootCmd.AddCommand(umountCmd)
+	rootCmd.AddCommand(pinCmd)
+	rootCmd.AddCommand(unpinCmd)
+	rootCmd.AddCommand(pinsCmd)
 }

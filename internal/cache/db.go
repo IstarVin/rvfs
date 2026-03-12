@@ -44,6 +44,8 @@ type FileEntry struct {
 	SyncError    string
 	RetryAfter   int64
 	Checksum     string
+	Pinned       bool
+	LastAccess   int64
 }
 
 // PendingOp mirrors one row in the pending_ops table.
@@ -139,14 +141,16 @@ func applySchema(db *sql.DB) error {
 func (m *MetadataDB) GetFile(path string) (*FileEntry, error) {
 	row := m.db.QueryRow(`
 		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
-		       cache_path, state, cached_ranges, sync_error, retry_after, checksum
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
 		FROM files WHERE path = ?`, path)
 
 	e := &FileEntry{}
 	err := row.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
 		&e.RemoteMtime, &e.LocalMtime,
 		&e.CachePath, &e.State, &e.CachedRanges,
-		&e.SyncError, &e.RetryAfter, &e.Checksum)
+		&e.SyncError, &e.RetryAfter, &e.Checksum,
+		&e.Pinned, &e.LastAccess)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -160,8 +164,9 @@ func (m *MetadataDB) GetFile(path string) (*FileEntry, error) {
 func (m *MetadataDB) PutFile(e *FileEntry) error {
 	_, err := m.db.Exec(`
 		INSERT INTO files (path, is_dir, size, mode, remote_mtime, local_mtime,
-		                   cache_path, state, cached_ranges, sync_error, retry_after, checksum)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                   cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		                   pinned, last_access)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 			is_dir        = excluded.is_dir,
 			size          = excluded.size,
@@ -173,9 +178,12 @@ func (m *MetadataDB) PutFile(e *FileEntry) error {
 			cached_ranges = excluded.cached_ranges,
 			sync_error    = excluded.sync_error,
 			retry_after   = excluded.retry_after,
-			checksum      = excluded.checksum`,
+			checksum      = excluded.checksum,
+			pinned        = excluded.pinned,
+			last_access   = excluded.last_access`,
 		e.Path, e.IsDir, e.Size, e.Mode, e.RemoteMtime, e.LocalMtime,
-		e.CachePath, e.State, e.CachedRanges, e.SyncError, e.RetryAfter, e.Checksum)
+		e.CachePath, e.State, e.CachedRanges, e.SyncError, e.RetryAfter, e.Checksum,
+		e.Pinned, e.LastAccess)
 	if err != nil {
 		return fmt.Errorf("put file %q: %w", e.Path, err)
 	}
@@ -186,8 +194,9 @@ func (m *MetadataDB) PutFile(e *FileEntry) error {
 func (m *MetadataDB) PutFileTx(tx *sql.Tx, e *FileEntry) error {
 	_, err := tx.Exec(`
 		INSERT INTO files (path, is_dir, size, mode, remote_mtime, local_mtime,
-		                   cache_path, state, cached_ranges, sync_error, retry_after, checksum)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                   cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		                   pinned, last_access)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 			is_dir        = excluded.is_dir,
 			size          = excluded.size,
@@ -199,9 +208,12 @@ func (m *MetadataDB) PutFileTx(tx *sql.Tx, e *FileEntry) error {
 			cached_ranges = excluded.cached_ranges,
 			sync_error    = excluded.sync_error,
 			retry_after   = excluded.retry_after,
-			checksum      = excluded.checksum`,
+			checksum      = excluded.checksum,
+			pinned        = excluded.pinned,
+			last_access   = excluded.last_access`,
 		e.Path, e.IsDir, e.Size, e.Mode, e.RemoteMtime, e.LocalMtime,
-		e.CachePath, e.State, e.CachedRanges, e.SyncError, e.RetryAfter, e.Checksum)
+		e.CachePath, e.State, e.CachedRanges, e.SyncError, e.RetryAfter, e.Checksum,
+		e.Pinned, e.LastAccess)
 	if err != nil {
 		return fmt.Errorf("put file tx %q: %w", e.Path, err)
 	}
@@ -233,7 +245,8 @@ func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
 
 	rows, err := m.db.Query(`
 		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
-		       cache_path, state, cached_ranges, sync_error, retry_after, checksum
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
 		FROM files
 		WHERE path LIKE ? AND path != ?`,
 		prefix+"%", dirPath)
@@ -248,7 +261,8 @@ func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
 		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
 			&e.RemoteMtime, &e.LocalMtime,
 			&e.CachePath, &e.State, &e.CachedRanges,
-			&e.SyncError, &e.RetryAfter, &e.Checksum); err != nil {
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
 			return nil, fmt.Errorf("scan dir entry: %w", err)
 		}
 		// Filter to immediate children only: the relative portion after the
@@ -266,7 +280,8 @@ func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
 func (m *MetadataDB) ListByState(state FileState) ([]*FileEntry, error) {
 	rows, err := m.db.Query(`
 		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
-		       cache_path, state, cached_ranges, sync_error, retry_after, checksum
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
 		FROM files WHERE state = ?`, state)
 	if err != nil {
 		return nil, fmt.Errorf("list by state %q: %w", state, err)
@@ -279,7 +294,8 @@ func (m *MetadataDB) ListByState(state FileState) ([]*FileEntry, error) {
 		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
 			&e.RemoteMtime, &e.LocalMtime,
 			&e.CachePath, &e.State, &e.CachedRanges,
-			&e.SyncError, &e.RetryAfter, &e.Checksum); err != nil {
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
 			return nil, fmt.Errorf("scan state entry: %w", err)
 		}
 		result = append(result, e)
@@ -505,4 +521,121 @@ func (m *MetadataDB) GetConflict(id int64) (*ConflictEntry, error) {
 		return nil, fmt.Errorf("get conflict %d: %w", id, err)
 	}
 	return e, nil
+}
+
+// ---------- eviction helpers ----------
+
+// SetPinned sets or clears the pinned flag for a file path.
+func (m *MetadataDB) SetPinned(path string, pinned bool) error {
+	v := 0
+	if pinned {
+		v = 1
+	}
+	res, err := m.db.Exec(`UPDATE files SET pinned = ? WHERE path = ?`, v, path)
+	if err != nil {
+		return fmt.Errorf("set pinned %q: %w", path, err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("set pinned: path %q not found", path)
+	}
+	return nil
+}
+
+// UpdateLastAccess sets last_access to ts (Unix seconds) for the given path.
+// Errors are silently ignored by callers — best-effort tracking.
+func (m *MetadataDB) UpdateLastAccess(path string, ts int64) error {
+	_, err := m.db.Exec(`UPDATE files SET last_access = ? WHERE path = ?`, ts, path)
+	if err != nil {
+		return fmt.Errorf("update last_access %q: %w", path, err)
+	}
+	return nil
+}
+
+// ListPinned returns all file entries that have pinned = 1.
+func (m *MetadataDB) ListPinned() ([]*FileEntry, error) {
+	rows, err := m.db.Query(`
+		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
+		FROM files WHERE pinned = 1 ORDER BY path`)
+	if err != nil {
+		return nil, fmt.Errorf("list pinned: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*FileEntry
+	for rows.Next() {
+		e := &FileEntry{}
+		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
+			&e.RemoteMtime, &e.LocalMtime,
+			&e.CachePath, &e.State, &e.CachedRanges,
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
+			return nil, fmt.Errorf("scan pinned entry: %w", err)
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// ListEvictable returns clean, unpinned, non-directory entries ordered by
+// last_access ascending (least recently accessed first). These are candidates
+// for cache eviction.
+func (m *MetadataDB) ListEvictable() ([]*FileEntry, error) {
+	rows, err := m.db.Query(`
+		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
+		FROM files
+		WHERE state = 'clean' AND pinned = 0 AND is_dir = 0
+		ORDER BY last_access ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list evictable: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*FileEntry
+	for rows.Next() {
+		e := &FileEntry{}
+		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
+			&e.RemoteMtime, &e.LocalMtime,
+			&e.CachePath, &e.State, &e.CachedRanges,
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
+			return nil, fmt.Errorf("scan evictable entry: %w", err)
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// CountPendingOps returns the number of rows in pending_ops.
+func (m *MetadataDB) CountPendingOps() (int, error) {
+	var n int
+	err := m.db.QueryRow(`SELECT COUNT(*) FROM pending_ops`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count pending ops: %w", err)
+	}
+	return n, nil
+}
+
+// CountConflicts returns the number of rows in the conflicts table.
+func (m *MetadataDB) CountConflicts() (int, error) {
+	var n int
+	err := m.db.QueryRow(`SELECT COUNT(*) FROM conflicts`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count conflicts: %w", err)
+	}
+	return n, nil
+}
+
+// ResetRetryAfter sets retry_after = 0 for all pending_ops, clearing backoff
+// timers so the next sync cycle retries everything immediately.
+func (m *MetadataDB) ResetRetryAfter() error {
+	_, err := m.db.Exec(`UPDATE pending_ops SET retry_after = 0`)
+	if err != nil {
+		return fmt.Errorf("reset retry_after: %w", err)
+	}
+	return nil
 }

@@ -1,0 +1,129 @@
+package cache
+
+import (
+	"context"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// Evictor enforces a maximum cache size and optional per-file age limit by
+// removing clean, unpinned files from the local cache. Evicted entries have
+// their state set to StateEvicted so FUSE knows to re-download on next access.
+type Evictor struct {
+	// MaxSize is the maximum total size of the files/ directory in bytes.
+	// 0 means no size limit.
+	MaxSize int64
+	// MaxAge is the maximum time since a clean file was last accessed before
+	// it is evicted regardless of space pressure. 0 means no age limit.
+	MaxAge time.Duration
+
+	// TriggerC is an optional channel the sync engine uses to nudge the
+	// evictor after every sync cycle. The evictor buffers and de-duplicates
+	// triggers so the channel should be unbuffered or buffered≥1.
+	TriggerC <-chan struct{}
+}
+
+// Run starts the eviction loop. It blocks until ctx is cancelled.
+// A fallback ticker fires every 5 minutes regardless of TriggerC.
+func (ev *Evictor) Run(ctx context.Context, cl *CacheLayer) {
+	tick := time.NewTicker(5 * time.Minute)
+	defer tick.Stop()
+
+	ev.check(cl)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			ev.check(cl)
+		case _, ok := <-ev.TriggerC:
+			if !ok {
+				return
+			}
+			ev.check(cl)
+		}
+	}
+}
+
+// check runs a single eviction pass: first by age, then by size.
+func (ev *Evictor) check(cl *CacheLayer) {
+	if ev.MaxAge > 0 {
+		ev.evictByAge(cl)
+	}
+	if ev.MaxSize > 0 {
+		ev.evictBySize(cl)
+	}
+}
+
+// evictByAge removes clean unpinned files not accessed within MaxAge.
+func (ev *Evictor) evictByAge(cl *CacheLayer) {
+	entries, err := cl.db.ListEvictable()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-ev.MaxAge).Unix()
+	for _, e := range entries {
+		if e.LastAccess > cutoff {
+			continue
+		}
+		evictEntry(cl, e)
+	}
+}
+
+// evictBySize removes the least-recently-accessed clean unpinned files until
+// the total files/ directory usage is below MaxSize.
+func (ev *Evictor) evictBySize(cl *CacheLayer) {
+	used, err := dirSize(cl.filesDir)
+	if err != nil || used <= ev.MaxSize {
+		return
+	}
+
+	entries, err := cl.db.ListEvictable()
+	if err != nil {
+		return
+	}
+
+	for _, e := range entries {
+		if used <= ev.MaxSize {
+			break
+		}
+		freed := e.Size
+		evictEntry(cl, e)
+		used -= freed
+	}
+}
+
+// evictEntry removes the on-disk cache file and marks the DB entry evicted.
+func evictEntry(cl *CacheLayer, e *FileEntry) {
+	dp := cl.diskPath(e.Path)
+	if err := os.Remove(dp); err != nil && !os.IsNotExist(err) {
+		return
+	}
+	_ = cl.db.SetState(e.Path, StateEvicted)
+}
+
+// dirSize returns the total byte size of all regular files under dir.
+func dirSize(dir string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil // skip unreadable files
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
+}
+
+// DirSize is the exported version of dirSize, used by callers outside the
+// cache package (e.g. the IPC status handler in the CLI).
+func DirSize(dir string) (int64, error) {
+	return dirSize(dir)
+}

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/IstarVin/rvfs/internal/config"
 	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/fuse"
+	"github.com/IstarVin/rvfs/internal/ipc"
 	"github.com/IstarVin/rvfs/internal/remote/gdrive"
 	syncpkg "github.com/IstarVin/rvfs/internal/sync"
 	"github.com/spf13/cobra"
@@ -26,6 +28,8 @@ var (
 	mountReadAhead        int64
 	mountIdleTimeout      time.Duration
 	mountConflictStrategy string
+	mountCacheSize        int64
+	mountCacheMaxAge      time.Duration
 )
 
 var mountCmd = &cobra.Command{
@@ -70,6 +74,12 @@ For a configured remote:
 			}
 			if !cmd.Flags().Changed("conflict") {
 				mountConflictStrategy = mc.ConflictStrategy
+			}
+			if !cmd.Flags().Changed("cache-size") {
+				mountCacheSize = mc.CacheSize.Int64()
+			}
+			if !cmd.Flags().Changed("cache-max-age") {
+				mountCacheMaxAge = mc.CacheMaxAge.D()
 			}
 		}
 
@@ -191,6 +201,29 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon, syncpkg.ConflictStrategy(mountConflictStrategy))
 	engine.Start()
 
+	// Start IPC server so status/sync commands can communicate with us.
+	source := remoteName + ":" + remotePath
+	sockPath := ipc.SockPath(remoteID)
+	srv := ipc.NewServer(sockPath, &mountHandler{
+		source:     source,
+		mountpoint: mountpoint,
+		cl:         cl,
+		engine:     engine,
+		mon:        mon,
+		maxSize:    mountCacheSize,
+	})
+	if listenErr := srv.Listen(); listenErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: IPC server unavailable: %v\n", listenErr)
+	} else {
+		defer srv.Close()
+	}
+
+	// Start LRU evictor.
+	evCtx, evCancel := context.WithCancel(context.Background())
+	defer evCancel()
+	ev := &cache.Evictor{MaxSize: mountCacheSize, MaxAge: mountCacheMaxAge}
+	go ev.Run(evCtx, cl)
+
 	// Do an initial pull only when the local metadata DB is empty.
 	// If data is already present, the background sync engine will handle
 	// any remote changes without blocking the mount.
@@ -207,6 +240,44 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	server.Wait()
 	engine.Stop()
 	cl.Close()
+	return nil
+}
+
+// mountHandler implements ipc.Handler for a running mount process.
+type mountHandler struct {
+	source     string
+	mountpoint string
+	cl         *cache.CacheLayer
+	engine     *syncpkg.Engine
+	mon        *connectivity.Monitor
+	maxSize    int64
+}
+
+func (h *mountHandler) HandleStatus() (ipc.StatusResponse, error) {
+	pending, _ := h.cl.DB().CountPendingOps()
+	conflicts, _ := h.cl.DB().CountConflicts()
+	used, _ := cache.DirSize(h.cl.FilesDir())
+	online := h.mon != nil && h.mon.State() == connectivity.StateOnline
+	return ipc.StatusResponse{
+		Source:     h.source,
+		Mountpoint: h.mountpoint,
+		Online:     online,
+		CacheUsed:  used,
+		CacheTotal: h.maxSize,
+		Pending:    pending,
+		Conflicts:  conflicts,
+	}, nil
+}
+
+func (h *mountHandler) HandleSync(force bool) error {
+	if force {
+		if err := h.cl.DB().ResetRetryAfter(); err != nil {
+			return err
+		}
+	}
+	go func() {
+		_ = h.engine.PullOnce()
+	}()
 	return nil
 }
 
@@ -279,4 +350,9 @@ func init() {
 
 	mountConflictStrategy = "both"
 	mountCmd.Flags().StringVar(&mountConflictStrategy, "conflict", "both", "Conflict resolution strategy: both, local-wins, remote-wins, manual")
+
+	mountCacheSize = 20 * 1024 * 1024 * 1024 // 20 GiB default
+	mountCmd.Flags().Var((*byteSizeValue)(&mountCacheSize), "cache-size", "Maximum total cache size; evict clean files when exceeded (e.g. 10G, 500M); 0 = unlimited")
+
+	mountCmd.Flags().Var((*durationValue)(&mountCacheMaxAge), "cache-max-age", "Evict clean files not accessed for this long (e.g. 7d=168h, 30d=720h); 0 = disabled")
 }

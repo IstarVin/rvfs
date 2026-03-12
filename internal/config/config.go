@@ -114,6 +114,11 @@ type MountConfig struct {
 	IdleTimeout Duration `toml:"idle_timeout"`
 	// ConflictStrategy is one of: both, local-wins, remote-wins, manual.
 	ConflictStrategy string `toml:"conflict_strategy"`
+	// CacheSize is the maximum total size of the file cache. 0 means unlimited.
+	CacheSize ByteSize `toml:"cache_size"`
+	// CacheMaxAge evicts clean files that have not been accessed for longer
+	// than this duration. 0 means never evict by age.
+	CacheMaxAge Duration `toml:"cache_max_age"`
 }
 
 // DefaultMountConfig returns a MountConfig pre-populated with the same
@@ -126,6 +131,7 @@ func DefaultMountConfig() MountConfig {
 		ReadAhead:        ByteSize(64 * 1024 * 1024), // 64 MiB
 		IdleTimeout:      Duration(5),                // matches old mountIdleTimeout = 5
 		ConflictStrategy: "both",
+		CacheSize:        ByteSize(20 * 1024 * 1024 * 1024), // 20 GiB
 	}
 }
 
