@@ -1,6 +1,7 @@
 package connectivity_test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -35,7 +36,9 @@ func (a *mockAdapter) List(_ string) ([]remote.FileInfo, error)              { r
 func (a *mockAdapter) Stat(_ string) (remote.FileInfo, error)                { return remote.FileInfo{}, nil }
 func (a *mockAdapter) Get(_ string, _ io.Writer) error                       { return nil }
 func (a *mockAdapter) GetRange(_ string, _, _ int64, _ io.Writer) error      { return nil }
-func (a *mockAdapter) Put(_ string, _ io.Reader, _ int64, _ time.Time) error { return nil }
+func (a *mockAdapter) Put(_ context.Context, _ string, _ io.Reader, _ int64, _ time.Time) error {
+	return nil
+}
 func (a *mockAdapter) Delete(_ string) error                                 { return nil }
 func (a *mockAdapter) Mkdir(_ string) error                                  { return nil }
 func (a *mockAdapter) Rename(_, _ string) error                              { return nil }

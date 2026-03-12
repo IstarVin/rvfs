@@ -324,8 +324,10 @@ func TestCacheChtimes(t *testing.T) {
 
 func TestCacheDeleteNonexistent(t *testing.T) {
 	cl := newTestCache(t)
+	// Deleting a path that was never created should succeed silently —
+	// the in-flight download or upload may have already removed the file.
 	err := cl.Delete("no-such-file.txt")
-	assert.Error(t, err)
+	assert.NoError(t, err)
 }
 
 func TestCacheRenameNonexistent(t *testing.T) {

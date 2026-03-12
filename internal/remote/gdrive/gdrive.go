@@ -297,7 +297,7 @@ func (g *GDriveAdapter) GetRange(filePath string, offset, length int64, dest io.
 	return err
 }
 
-func (g *GDriveAdapter) Put(filePath string, src io.Reader, size int64, mtime time.Time) error {
+func (g *GDriveAdapter) Put(ctx context.Context, filePath string, src io.Reader, size int64, mtime time.Time) error {
 	dirPath, name := path.Split(filePath)
 	dirPath = strings.TrimSuffix(dirPath, "/")
 
@@ -317,12 +317,14 @@ func (g *GDriveAdapter) Put(filePath string, src io.Reader, size int64, mtime ti
 	if existingID != "" {
 		// Update existing file.
 		_, err = g.srv.Files.Update(existingID, meta).
+			Context(ctx).
 			Media(src).
 			Do()
 	} else {
 		// Create new file.
 		meta.Parents = []string{parentID}
 		_, err = g.srv.Files.Create(meta).
+			Context(ctx).
 			Media(src).
 			Do()
 	}

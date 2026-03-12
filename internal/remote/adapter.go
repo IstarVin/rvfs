@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"context"
 	"io"
 	"time"
 )
@@ -34,7 +35,8 @@ type RemoteAdapter interface {
 	GetRange(path string, offset, length int64, dest io.Writer) error
 
 	// Put uploads the contents of src as a file at path.
-	Put(path string, src io.Reader, size int64, mtime time.Time) error
+	// The caller may cancel ctx to abort the upload.
+	Put(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error
 
 	// Delete removes a file at path.
 	Delete(path string) error

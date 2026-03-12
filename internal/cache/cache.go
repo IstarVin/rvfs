@@ -282,7 +282,7 @@ func (c *CacheLayer) Chtimes(rel string, atime, mtime time.Time) error {
 // a delete operation.
 func (c *CacheLayer) Delete(rel string) error {
 	dp := c.diskPath(rel)
-	if err := os.Remove(dp); err != nil {
+	if err := os.Remove(dp); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
@@ -418,6 +418,23 @@ func (c *CacheLayer) Rename(oldRel, newRel string) error {
 			return err
 		}
 	}
+
+	// Update any queued pending_ops that reference the old path so that the
+	// sync engine operates on the correct (new) name. Both updates share the
+	// same transaction as the files-table update → atomic rename.
+	if _, err := tx.Exec(
+		`UPDATE pending_ops SET path = ? WHERE op IN ('put','mkdir') AND path = ?`,
+		newRel, oldRel,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE pending_ops SET dest_path = ? WHERE op = 'rename' AND dest_path = ?`,
+		newRel, oldRel,
+	); err != nil {
+		return err
+	}
+
 	if err := c.db.AddPendingOpTx(tx, &PendingOp{
 		Op:       "rename",
 		Path:     oldRel,

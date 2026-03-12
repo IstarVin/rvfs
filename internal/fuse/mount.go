@@ -10,6 +10,7 @@ import (
 	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/download"
 	"github.com/IstarVin/rvfs/internal/remote"
+	syncpkg "github.com/IstarVin/rvfs/internal/sync"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -35,6 +36,12 @@ type MountOptions struct {
 	// The goroutine restarts automatically on the next read.
 	// 0 means wait indefinitely. Only meaningful when ReadAhead > 0.
 	IdleTimeout time.Duration
+	// SyncEngine is the background sync engine. When non-nil, uploads in
+	// flight are cancelled when the owning file is unlinked.
+	SyncEngine *syncpkg.Engine
+	// VerifyChecksums, when true, re-hashes clean cache files on Open and
+	// evicts them if the checksum does not match the stored value.
+	VerifyChecksums bool
 }
 
 // Mount creates a CacheLayer for the given remote-id, mounts it at mountpoint,
@@ -63,6 +70,10 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 	if opts.Monitor != nil {
 		rootState.monitor = opts.Monitor
 	}
+	if opts.SyncEngine != nil {
+		rootState.syncEngine = opts.SyncEngine
+	}
+	rootState.verifyChecksums = opts.VerifyChecksums
 
 	root := &FuseNode{
 		rel:  "",

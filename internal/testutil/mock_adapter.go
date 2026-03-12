@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -39,7 +40,7 @@ type MockRemoteAdapter struct {
 	GetRangeFunc func(path string, offset, length int64, dest io.Writer) error
 	GetRangeErr  error
 
-	PutFunc func(path string, src io.Reader, size int64, mtime time.Time) error
+	PutFunc func(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error
 	PutErr  error
 
 	DeleteFunc func(path string) error
@@ -129,12 +130,12 @@ func (m *MockRemoteAdapter) GetRange(path string, offset, length int64, dest io.
 	return m.GetRangeErr
 }
 
-func (m *MockRemoteAdapter) Put(path string, src io.Reader, size int64, mtime time.Time) error {
+func (m *MockRemoteAdapter) Put(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Put", path, size)
 	if m.PutFunc != nil {
-		return m.PutFunc(path, src, size, mtime)
+		return m.PutFunc(ctx, path, src, size, mtime)
 	}
 	return m.PutErr
 }

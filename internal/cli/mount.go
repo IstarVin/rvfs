@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,13 +16,21 @@ import (
 	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/fuse"
 	"github.com/IstarVin/rvfs/internal/ipc"
+	"github.com/IstarVin/rvfs/internal/remote"
 	"github.com/IstarVin/rvfs/internal/remote/gdrive"
+	"github.com/IstarVin/rvfs/internal/service"
 	syncpkg "github.com/IstarVin/rvfs/internal/sync"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var (
 	mountDebug            bool
+	mountForeground       bool
+	mountLogLevel         string
+	mountVerifyChecksums  bool
+	mountInstallService   bool
+	mountUninstallService bool
 	mountCacheDir         string
 	mountPollInterval     time.Duration
 	mountProbeInterval    time.Duration
@@ -47,6 +57,11 @@ For a configured remote:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		source := args[0]
 		mountpoint := args[1]
+
+		// Handle --install-service / --uninstall-service before anything else.
+		if mountInstallService || mountUninstallService {
+			return handleServiceInstall(source, mountpoint, args, cmd)
+		}
 
 		// Apply config-file defaults for any flag the user did not explicitly set.
 		if globalCfg != nil {
@@ -96,6 +111,34 @@ For a configured remote:
 			return fmt.Errorf("invalid --conflict %q: must be one of both, local-wins, remote-wins, manual", mountConflictStrategy)
 		}
 
+		// Configure structured logging.
+		var logLevel slog.Level
+		switch strings.ToLower(mountLogLevel) {
+		case "debug":
+			logLevel = slog.LevelDebug
+		case "warn", "warning":
+			logLevel = slog.LevelWarn
+		case "error":
+			logLevel = slog.LevelError
+		default:
+			logLevel = slog.LevelInfo
+		}
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+
+		// Daemonize by re-launching with --foreground unless already in foreground.
+		if !mountForeground {
+			newArgs := append(os.Args[1:], "--foreground")
+			cmd := exec.Command(os.Args[0], newArgs...)
+			cmd.Stdin = nil
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("daemonize: %w", err)
+			}
+			fmt.Fprintf(os.Stdout, "rvfs daemon started (pid %d)\n", cmd.Process.Pid)
+			return nil
+		}
+
 		// Determine if source is a remote (contains ':') or a local path.
 		if before, after, ok := strings.Cut(source, ":"); ok {
 			return mountRemote(before, after, mountpoint, cacheDir)
@@ -120,7 +163,7 @@ func mountLocal(backingDir, mountpoint, cacheDir string) error {
 		return fmt.Errorf("seed cache: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Mounted %s at %s (press Ctrl-C to unmount)\n", backingDir, mountpoint)
+	slog.Info("mounted", "source", backingDir, "mountpoint", mountpoint)
 	server.Wait()
 	cl.Close()
 	return nil
@@ -176,8 +219,11 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 			cl.Close()
 			return fmt.Errorf("probe remote: %w", probeErr)
 		}
-		fmt.Fprintf(os.Stderr, "Warning: remote unreachable (%v); mounting offline from cache\n", probeErr)
+		slog.Warn("remote unreachable; mounting offline from cache", "err", probeErr)
 	}
+
+	// Recover any downloads that were interrupted by a previous crash.
+	recoverDownloads(cl, adapter)
 
 	// Start the connectivity monitor.
 	mon := connectivity.New(adapter, mountProbeInterval, 3)
@@ -185,12 +231,18 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	mon.Start()
 	defer mon.Stop()
 
+	// Create the sync engine before mounting so we can pass it to the FUSE
+	// layer for upload cancellation on Unlink. Start it after the mount is up.
+	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon, syncpkg.ConflictStrategy(mountConflictStrategy))
+
 	_, server, err := fuse.Mount(cacheDir, remoteID, mountpoint, fuse.MountOptions{
-		Debug:       mountDebug,
-		Adapter:     adapter,
-		Monitor:     mon,
-		ReadAhead:   mountReadAhead,
-		IdleTimeout: mountIdleTimeout,
+		Debug:           mountDebug,
+		Adapter:         adapter,
+		Monitor:         mon,
+		ReadAhead:       mountReadAhead,
+		IdleTimeout:     mountIdleTimeout,
+		VerifyChecksums: mountVerifyChecksums,
+		SyncEngine:      engine,
 	})
 	if err != nil {
 		cl.Close()
@@ -198,7 +250,6 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	}
 
 	// Start sync engine.
-	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon, syncpkg.ConflictStrategy(mountConflictStrategy))
 	engine.Start()
 
 	// Start IPC server so status/sync commands can communicate with us.
@@ -213,7 +264,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		maxSize:    mountCacheSize,
 	})
 	if listenErr := srv.Listen(); listenErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: IPC server unavailable: %v\n", listenErr)
+		slog.Warn("IPC server unavailable", "err", listenErr)
 	} else {
 		defer srv.Close()
 	}
@@ -228,19 +279,45 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	// If data is already present, the background sync engine will handle
 	// any remote changes without blocking the mount.
 	if hasData, err := cl.DB().HasFiles(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: checking cache state failed: %v\n", err)
+		slog.Warn("checking cache state failed", "err", err)
 	} else if !hasData {
 		if err := engine.PullOnce(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: initial pull failed: %v\n", err)
+			slog.Warn("initial pull failed", "err", err)
 		}
 	}
 
 	label := remoteName + ":" + remotePath
-	fmt.Fprintf(os.Stderr, "Mounted %s at %s (press Ctrl-C to unmount)\n", label, mountpoint)
+	slog.Info("mounted", "source", label, "mountpoint", mountpoint)
 	server.Wait()
 	engine.Stop()
 	cl.Close()
 	return nil
+}
+
+// recoverDownloads inspects the DB for files left in StateDownloading (which
+// means a previous process was killed mid-download) and either resets them to
+// StateEvicted (for adapters without range support) or leaves them as
+// StateDownloading so that Manager.Start() can resume from the persisted
+// CachedRanges on the next Open call.
+func recoverDownloads(cl *cache.CacheLayer, adapter remote.RemoteAdapter) {
+	entries, err := cl.DB().ListByState(cache.StateDownloading)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	for _, e := range entries {
+		if !adapter.SupportsRange() {
+			// Cannot resume from partial ranges — restart from scratch.
+			if setErr := cl.DB().SetState(e.Path, cache.StateEvicted); setErr != nil {
+				slog.Warn("recover download: reset to evicted", "path", e.Path, "err", setErr)
+			} else {
+				slog.Info("recover download: reset to evicted (no range support)", "path", e.Path)
+			}
+		} else {
+			// Leave as StateDownloading; Manager.Start() will reload CachedRanges
+			// and resume from gaps on the next Open.
+			slog.Info("recover download: resumable via persisted ranges", "path", e.Path)
+		}
+	}
 }
 
 // mountHandler implements ipc.Handler for a running mount process.
@@ -252,6 +329,45 @@ type mountHandler struct {
 	mon        *connectivity.Monitor
 	maxSize    int64
 }
+
+// handleServiceInstall handles --install-service and --uninstall-service. It
+// detects the host OS at runtime and delegates to the appropriate backend.
+func handleServiceInstall(source, mountpoint string, _ []string, cmd *cobra.Command) error {
+	name := strings.NewReplacer(":", "-", "/", "-").Replace(source)
+	if name == "" {
+		name = "default"
+	}
+
+	// Build the extra flags to preserve (skip service-control flags).
+	skip := map[string]bool{
+		"install-service": true, "uninstall-service": true,
+		"foreground": true, // added by the service template
+	}
+	var extra []string
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		if !skip[f.Name] {
+			extra = append(extra, "--"+f.Name+"="+f.Value.String())
+		}
+	})
+
+	if mountUninstallService {
+		// Try systemd first, then launchd.
+		if err := service.UninstallSystemdService(name); err != nil {
+			return service.UninstallLaunchdService(name)
+		}
+		return nil
+	}
+
+	// --install-service: pick backend based on OS.
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		return service.InstallSystemdService(name, source, mountpoint, extra)
+	}
+	if _, err := exec.LookPath("launchctl"); err == nil {
+		return service.InstallLaunchdService(name, source, mountpoint, extra)
+	}
+	return fmt.Errorf("--install-service: neither systemctl nor launchctl found on PATH")
+}
+
 
 func (h *mountHandler) HandleStatus() (ipc.StatusResponse, error) {
 	pending, _ := h.cl.DB().CountPendingOps()
@@ -331,6 +447,9 @@ func (b *byteSizeValue) String() string { return strconv.FormatInt(int64(*b), 10
 
 func init() {
 	mountCmd.Flags().BoolVar(&mountDebug, "debug", false, "Enable FUSE debug logging")
+	mountCmd.Flags().BoolVar(&mountForeground, "foreground", false, "Run in foreground instead of daemonizing")
+	mountCmd.Flags().StringVar(&mountLogLevel, "log-level", "info", "Log level: debug, info, warn, error")
+	mountCmd.Flags().BoolVar(&mountVerifyChecksums, "verify-checksums", false, "Verify SHA256 checksum of cached files on open (off by default for performance)")
 	mountCmd.Flags().StringVar(&mountCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
 
 	mountPollInterval = 30 * time.Second
@@ -355,4 +474,7 @@ func init() {
 	mountCmd.Flags().Var((*byteSizeValue)(&mountCacheSize), "cache-size", "Maximum total cache size; evict clean files when exceeded (e.g. 10G, 500M); 0 = unlimited")
 
 	mountCmd.Flags().Var((*durationValue)(&mountCacheMaxAge), "cache-max-age", "Evict clean files not accessed for this long (e.g. 7d=168h, 30d=720h); 0 = disabled")
+
+	mountCmd.Flags().BoolVar(&mountInstallService, "install-service", false, "Install OS service (systemd/launchd) to auto-start on login and exit")
+	mountCmd.Flags().BoolVar(&mountUninstallService, "uninstall-service", false, "Remove previously installed OS service and exit")
 }

@@ -2,16 +2,20 @@ package fuse
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/download"
+	syncpkg "github.com/IstarVin/rvfs/internal/sync"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -19,8 +23,17 @@ import (
 // RootState holds shared state for all nodes in the FUSE tree.
 type RootState struct {
 	cache       *cache.CacheLayer
-	downloadMgr *download.Manager     // nil when using backing-dir mode
-	monitor     *connectivity.Monitor // nil when using backing-dir mode
+	downloadMgr *download.Manager      // nil when using backing-dir mode
+	monitor     *connectivity.Monitor  // nil when using backing-dir mode
+	syncEngine  *syncpkg.Engine        // nil when using backing-dir mode
+
+	// writeMu serialises concurrent writes to the same path within this
+	// process. The map stores *sync.Mutex values keyed by relative path.
+	writeMu sync.Map
+
+	// verifyChecksums, when true, hashes clean cache files on Open and
+	// evicts them if the checksum does not match the stored value.
+	verifyChecksums bool
 }
 
 // FuseNode is a node in the FUSE filesystem tree.
@@ -44,6 +57,16 @@ func inodeFor(rel string) uint64 {
 		return 1
 	}
 	return v
+}
+
+// lockForWrite returns the per-path write mutex for rel, creating it if
+// necessary, and returns it locked. The caller must call the returned unlock
+// function when the write is complete.
+func (r *RootState) lockForWrite(rel string) (unlock func()) {
+	v, _ := r.writeMu.LoadOrStore(rel, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // childRel returns the relative path for a child of this node.
@@ -276,7 +299,22 @@ func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	if err != nil {
 		return nil, 0, toErrno(err)
 	}
-	return &fileHandle{f: f}, 0, 0
+
+	// Optional checksum verification: if enabled and a stored checksum exists,
+	// hash the cache file and evict it on mismatch to force re-download.
+	if n.root.verifyChecksums {
+		entry, _ := n.root.cache.Stat(n.rel)
+		if entry != nil && entry.Checksum != "" {
+			if corrupt := verifyCacheFile(f, entry.Checksum); corrupt {
+				f.Close()
+				_ = n.root.cache.DB().SetState(n.rel, cache.StateEvicted)
+				// Retry Open — the evicted state will trigger a fresh download.
+				return n.Open(ctx, flags)
+			}
+		}
+	}
+
+	return &fileHandle{f: f, rel: n.rel, root: n.root}, 0, 0
 }
 
 // --- NodeCreater ---
@@ -302,7 +340,7 @@ func (n *FuseNode) Create(ctx context.Context, name string, flags uint32, mode u
 		Mode: entry.Mode,
 		Ino:  inodeFor(rel),
 	})
-	return child, &fileHandle{f: f}, 0, 0
+	return child, &fileHandle{f: f, rel: rel, root: n.root}, 0, 0
 }
 
 // --- NodeUnlinker ---
@@ -311,6 +349,16 @@ var _ fs.NodeUnlinker = (*FuseNode)(nil)
 
 func (n *FuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	rel := n.childRel(name)
+
+	// Cancel any in-progress download for this path before removing the file.
+	if n.root.downloadMgr != nil {
+		n.root.downloadMgr.Cancel(rel)
+	}
+	// Cancel any in-flight upload for this path.
+	if n.root.syncEngine != nil {
+		n.root.syncEngine.CancelUpload(rel)
+	}
+
 	if err := n.root.cache.Delete(rel); err != nil {
 		return toErrno(err)
 	}
@@ -377,7 +425,9 @@ func (n *FuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 
 // fileHandle wraps an *os.File and implements fs.FileHandle with Read/Write.
 type fileHandle struct {
-	f *os.File
+	f    *os.File
+	rel  string
+	root *RootState
 }
 
 var _ fs.FileReader = (*fileHandle)(nil)
@@ -393,6 +443,8 @@ func (fh *fileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.
 }
 
 func (fh *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	unlock := fh.root.lockForWrite(fh.rel)
+	defer unlock()
 	n, err := fh.f.WriteAt(data, off)
 	if err != nil {
 		return uint32(n), toErrno(err)
@@ -447,4 +499,20 @@ func (dh *downloadFileHandle) Release(ctx context.Context) syscall.Errno {
 		return toErrno(err)
 	}
 	return 0
+}
+
+// verifyCacheFile computes the SHA256 of f (rewinding afterwards) and returns
+// true if the hash does not match expectedHex, indicating corruption.
+func verifyCacheFile(f *os.File, expectedHex string) (corrupt bool) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return false // cannot seek — skip verification
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	// Rewind so the caller can still read the file normally.
+	_, _ = f.Seek(0, io.SeekStart)
+	return got != expectedHex
 }

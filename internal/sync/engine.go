@@ -1,8 +1,10 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +29,11 @@ type Engine struct {
 
 	// resolver applies the configured conflict strategy. nil when no adapter.
 	resolver *Resolver
+
+	// uploadCtxs tracks cancellation functions for uploads in flight.
+	// Keyed by file path; used by CancelUpload to abort an ongoing Put.
+	uploadMu   sync.Mutex
+	uploadCtxs map[string]context.CancelFunc
 }
 
 // NewEngine creates a sync engine. monitor may be nil for local mounts or
@@ -38,12 +45,13 @@ func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time
 		strategy = StrategyBoth
 	}
 	e := &Engine{
-		adapter:  adapter,
-		cache:    cl,
-		interval: interval,
-		monitor:  monitor,
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		adapter:    adapter,
+		cache:      cl,
+		interval:   interval,
+		monitor:    monitor,
+		stopCh:     make(chan struct{}),
+		doneCh:     make(chan struct{}),
+		uploadCtxs: make(map[string]context.CancelFunc),
 	}
 	if adapter != nil {
 		e.resolver = NewResolver(strategy, cl, adapter)
@@ -127,6 +135,17 @@ func (e *Engine) PullOnce() error {
 	return e.pull()
 }
 
+// CancelUpload aborts any in-flight upload for the given path. It is a
+// no-op if no upload is currently active for that path.
+func (e *Engine) CancelUpload(path string) {
+	e.uploadMu.Lock()
+	cancel, ok := e.uploadCtxs[path]
+	e.uploadMu.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
 // ---------- Upload ----------
 
 func (e *Engine) uploadDirty() {
@@ -169,8 +188,20 @@ func (e *Engine) uploadFile(entry *cache.FileEntry) {
 	}
 	defer f.Close()
 
+	// Register a cancellable context so Unlink can abort this upload.
+	ctx, cancel := context.WithCancel(context.Background())
+	e.uploadMu.Lock()
+	e.uploadCtxs[entry.Path] = cancel
+	e.uploadMu.Unlock()
+	defer func() {
+		e.uploadMu.Lock()
+		delete(e.uploadCtxs, entry.Path)
+		e.uploadMu.Unlock()
+		cancel()
+	}()
+
 	mtime := time.Unix(entry.LocalMtime, 0)
-	if err := e.adapter.Put(entry.Path, f, entry.Size, mtime); err != nil {
+	if err := e.adapter.Put(ctx, entry.Path, f, entry.Size, mtime); err != nil {
 		// Revert to dirty on failure.
 		_ = e.cache.DB().SetState(entry.Path, cache.StateDirty)
 		// Record sync error.

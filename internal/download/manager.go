@@ -1,6 +1,8 @@
 package download
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -564,6 +566,15 @@ func (dl *Download) finish() {
 	// Signal the offline-watcher goroutine (if any) to exit before cleanup.
 	dl.closeFinished()
 
+	// Compute SHA256 checksum of the completed cache file before closing it.
+	checksum := ""
+	if _, err := dl.cacheFile.Seek(0, io.SeekStart); err == nil {
+		h := sha256.New()
+		if _, err := io.Copy(h, dl.cacheFile); err == nil {
+			checksum = hex.EncodeToString(h.Sum(nil))
+		}
+	}
+
 	dl.cacheFile.Close()
 
 	rangesJSON, _ := dl.rangeSet.MarshalJSON()
@@ -571,6 +582,9 @@ func (dl *Download) finish() {
 	if err == nil && entry != nil {
 		entry.State = cache.StateClean
 		entry.CachedRanges = string(rangesJSON)
+		if checksum != "" {
+			entry.Checksum = checksum
+		}
 		_ = dl.mgr.cache.DB().PutFile(entry)
 	}
 

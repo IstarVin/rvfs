@@ -374,6 +374,15 @@ func (m *MetadataDB) BeginTx() (*sql.Tx, error) {
 	return m.db.Begin()
 }
 
+// SetChecksum stores a checksum for the given path.
+func (m *MetadataDB) SetChecksum(filePath, checksum string) error {
+	_, err := m.db.Exec(`UPDATE files SET checksum = ? WHERE path = ?`, checksum, filePath)
+	if err != nil {
+		return fmt.Errorf("set checksum %q: %w", filePath, err)
+	}
+	return nil
+}
+
 // ---------- drive_path_ids CRUD ----------
 
 // DrivePathEntry mirrors one row in the drive_path_ids table.
