@@ -82,8 +82,9 @@ type Download struct {
 
 // goroutineInfo tracks a running download goroutine.
 type goroutineInfo struct {
-	cancel func()
-	pos    int64 // current download position (updated by the goroutine)
+	cancel       func()
+	pos          int64 // current download position (updated by the goroutine)
+	isSequential bool  // true for the single sequential fill goroutine
 }
 
 // Start begins downloading a remote file into the cache. If a download for
@@ -262,6 +263,17 @@ func (m *Manager) cancelAll() {
 // ---------- Download methods ----------
 
 func (dl *Download) waitForRange(offset, size int64) error {
+	// Clamp size to the file boundary so we never wait for bytes past EOF.
+	// FUSE can issue aligned reads (e.g. 128 KiB) that cross the end of file;
+	// Contains(offset, size) would return false forever in that case even after
+	// the download completes, causing a permanent hang.
+	if offset >= dl.totalSize {
+		return nil
+	}
+	if offset+size > dl.totalSize {
+		size = dl.totalSize - offset
+	}
+
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
 
@@ -274,6 +286,12 @@ func (dl *Download) waitForRange(offset, size int64) error {
 		return dl.err
 	}
 
+	// If the download is already marked done the whole file is present;
+	// Contains would have returned true above for any in-bounds range.
+	if dl.done {
+		return nil
+	}
+
 	// Spawn an on-demand goroutine if no goroutine is close to the
 	// requested offset. This enables immediate streaming from any
 	// position instead of waiting for the sequential goroutine.
@@ -284,8 +302,8 @@ func (dl *Download) waitForRange(offset, size int64) error {
 	// Cancel far-behind non-sequential goroutines to save bandwidth.
 	dl.cancelFarBehind(offset)
 
-	// Wait until the range is covered or an error occurs.
-	for !dl.rangeSet.Contains(offset, size) && dl.err == nil {
+	// Wait until the range is covered, an error occurs, or the download finishes.
+	for !dl.rangeSet.Contains(offset, size) && dl.err == nil && !dl.done {
 		dl.cond.Wait()
 	}
 
@@ -311,9 +329,11 @@ func (dl *Download) hasGoroutineNear(offset int64) bool {
 // cancelFarBehind cancels non-sequential goroutines whose position is
 // more than goroutineWindow behind the requested offset.
 func (dl *Download) cancelFarBehind(offset int64) {
-	for startOff, gi := range dl.goroutines {
+	for _, gi := range dl.goroutines {
 		// Never cancel the sequential goroutine (it fills the whole file).
-		if startOff == dl.seqPos || gi.pos >= offset {
+		// Using gi.isSequential is correct; seqPos is the *current* position
+		// of the goroutine and cannot be used to identify it by start offset.
+		if gi.isSequential || gi.pos >= offset {
 			continue
 		}
 		if offset-gi.pos > goroutineWindow {
@@ -325,8 +345,9 @@ func (dl *Download) cancelFarBehind(offset int64) {
 func (dl *Download) spawnGoroutine(startOffset int64, isSequential bool) {
 	doneCh := make(chan struct{})
 	gi := &goroutineInfo{
-		cancel: sync.OnceFunc(func() { close(doneCh) }),
-		pos:    startOffset,
+		cancel:       sync.OnceFunc(func() { close(doneCh) }),
+		pos:          startOffset,
+		isSequential: isSequential,
 	}
 	dl.goroutines[startOffset] = gi
 
