@@ -41,12 +41,16 @@ type Manager struct {
 // NewManager creates a Download Manager. monitor may be nil; when non-nil,
 // any active download is cancelled automatically when connectivity is lost.
 func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer, monitor *connectivity.Monitor) *Manager {
-	return &Manager{
+	m := &Manager{
 		adapter:   adapter,
 		cache:     cl,
 		monitor:   monitor,
 		downloads: make(map[string]*Download),
 	}
+	if monitor != nil {
+		go m.watchOffline()
+	}
+	return m
 }
 
 // Download tracks the state of a single file being downloaded.
@@ -223,6 +227,36 @@ func (m *Manager) IsDownloading(path string) bool {
 	_, ok := m.downloads[path]
 	m.mu.Unlock()
 	return ok
+}
+
+// watchOffline subscribes to the connectivity monitor and cancels all active
+// downloads when the monitor transitions to StateOffline, so partial ranges
+// are persisted to the DB and downloads resume cleanly on reconnect.
+func (m *Manager) watchOffline() {
+	ch := m.monitor.Subscribe()
+	for {
+		state, ok := <-ch
+		if !ok {
+			return
+		}
+		if state == connectivity.StateOffline {
+			m.cancelAll()
+		}
+	}
+}
+
+// cancelAll cancels every active download, persisting partial CachedRanges to
+// the DB as StateEvicted so they resume from where they left off on reconnect.
+func (m *Manager) cancelAll() {
+	m.mu.Lock()
+	paths := make([]string, 0, len(m.downloads))
+	for p := range m.downloads {
+		paths = append(paths, p)
+	}
+	m.mu.Unlock()
+	for _, p := range paths {
+		m.Cancel(p)
+	}
 }
 
 // ---------- Download methods ----------

@@ -40,9 +40,10 @@ func (s ConnState) String() string {
 // The context returned by Context() is cancelled for the duration of OFFLINE
 // and renewed when transitioning to RECONNECTING.
 type Monitor struct {
-	adapter   remote.RemoteAdapter
-	interval  time.Duration
-	threshold int // consecutive failures required to declare OFFLINE
+	adapter          remote.RemoteAdapter
+	interval         time.Duration
+	recoveryInterval time.Duration // probe cadence while OFFLINE; 0 means use interval
+	threshold        int           // consecutive failures required to declare OFFLINE
 
 	mu          sync.RWMutex
 	state       ConnState
@@ -69,6 +70,14 @@ func New(adapter remote.RemoteAdapter, interval time.Duration, threshold int) *M
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 	}
+}
+
+// SetRecoveryInterval sets a shorter probe interval used only while the
+// monitor is in StateOffline. This lets the monitor detect when the network
+// comes back more quickly than the normal online polling interval.
+// Must be called before Start.
+func (m *Monitor) SetRecoveryInterval(d time.Duration) {
+	m.recoveryInterval = d
 }
 
 // Start launches the background probe loop. Call Stop() to shut it down.
@@ -129,17 +138,31 @@ func (m *Monitor) NotifyQueueDrained() {
 func (m *Monitor) loop() {
 	defer close(m.doneCh)
 
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(m.nextDelay())
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-m.stopCh:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			m.probe()
+			timer.Reset(m.nextDelay())
 		}
 	}
+}
+
+// nextDelay returns how long to wait before the next probe.
+// When offline and a recovery interval has been configured, that shorter
+// interval is used so reconnection is detected quickly.
+func (m *Monitor) nextDelay() time.Duration {
+	m.mu.RLock()
+	offline := m.state == StateOffline
+	m.mu.RUnlock()
+	if offline && m.recoveryInterval > 0 {
+		return m.recoveryInterval
+	}
+	return m.interval
 }
 
 func (m *Monitor) probe() {

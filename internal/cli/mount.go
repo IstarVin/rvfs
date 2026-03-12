@@ -17,10 +17,11 @@ import (
 )
 
 var (
-	mountDebug         bool
-	mountCacheDir      string
-	mountPollInterval  time.Duration
-	mountProbeInterval time.Duration
+	mountDebug            bool
+	mountCacheDir         string
+	mountPollInterval     time.Duration
+	mountProbeInterval    time.Duration
+	mountRecoveryInterval time.Duration
 )
 
 var mountCmd = &cobra.Command{
@@ -119,14 +120,21 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		return fmt.Errorf("create gdrive adapter: %w", err)
 	}
 
-	// Probe connectivity.
-	if err := adapter.Probe(); err != nil {
-		cl.Close()
-		return fmt.Errorf("probe remote: %w", err)
+	// Probe connectivity. If the probe fails but a local cache DB already
+	// exists, allow mounting offline so cached files remain accessible.
+	if probeErr := adapter.Probe(); probeErr != nil {
+		dbPath := filepath.Join(cacheDir, remoteID, "meta.db")
+		if _, statErr := os.Stat(dbPath); statErr != nil {
+			// No local cache — nothing useful to serve offline.
+			cl.Close()
+			return fmt.Errorf("probe remote: %w", probeErr)
+		}
+		fmt.Fprintf(os.Stderr, "Warning: remote unreachable (%v); mounting offline from cache\n", probeErr)
 	}
 
 	// Start the connectivity monitor.
 	mon := connectivity.New(adapter, mountProbeInterval, 3)
+	mon.SetRecoveryInterval(mountRecoveryInterval)
 	mon.Start()
 	defer mon.Stop()
 
@@ -162,4 +170,5 @@ func init() {
 	mountCmd.Flags().StringVar(&mountCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
 	mountCmd.Flags().DurationVar(&mountPollInterval, "poll-interval", 30*time.Second, "Remote polling interval")
 	mountCmd.Flags().DurationVar(&mountProbeInterval, "probe-interval", 5*time.Second, "Connectivity probe interval")
+	mountCmd.Flags().DurationVar(&mountRecoveryInterval, "recovery-interval", 2*time.Second, "Probe interval while offline (for faster reconnect detection)")
 }
