@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
@@ -81,6 +82,12 @@ type Download struct {
 	rangeSet  *RangeSet
 	totalSize int64
 
+	// openCount is the number of active downloadFileHandle readers.
+	// When it drops to zero and readAhead > 0, the download is cancelled so
+	// bandwidth is not wasted after the last reader closes the file.
+	// Manipulated with atomic operations; does not require dl.mu.
+	openCount atomic.Int64
+
 	mu          sync.Mutex
 	cond        *sync.Cond
 	seqPos      int64 // current position of the sequential download goroutine
@@ -115,9 +122,11 @@ type goroutineInfo struct {
 func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, error) {
 	m.mu.Lock()
 	if dl, ok := m.downloads[path]; ok {
+		dl.openCount.Add(1)
 		m.mu.Unlock()
 		f, err := m.cache.Open(path, os.O_RDONLY)
 		if err != nil {
+			dl.openCount.Add(-1)
 			return nil, nil, err
 		}
 		return dl, f, nil
@@ -141,6 +150,7 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 		finishedCh:  make(chan struct{}),
 	}
 	dl.cond = sync.NewCond(&dl.mu)
+	dl.openCount.Store(1)
 
 	// Resume: load persisted CachedRanges from DB.
 	if entry, err := m.cache.Stat(path); err == nil && entry != nil && entry.CachedRanges != "" {
@@ -152,10 +162,12 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 
 	m.mu.Lock()
 	if existing, ok := m.downloads[path]; ok {
+		existing.openCount.Add(1)
 		m.mu.Unlock()
 		cacheFile.Close()
 		f, err := m.cache.Open(path, os.O_RDONLY)
 		if err != nil {
+			existing.openCount.Add(-1)
 			return nil, nil, err
 		}
 		return existing, f, nil
@@ -586,6 +598,21 @@ func (dl *Download) cancel() {
 	dl.mu.Unlock()
 
 	dl.cacheFile.Close()
+}
+
+// ReleaseReader decrements the open-handle count. When the last reader closes
+// and ReadAhead > 0, the download is cancelled so we don't burn bandwidth
+// after the player exits. Persisted ranges allow the next Open to resume.
+func (dl *Download) ReleaseReader() {
+	if dl.openCount.Add(-1) > 0 || dl.mgr.readAhead == 0 {
+		return
+	}
+	dl.mu.Lock()
+	done := dl.done
+	dl.mu.Unlock()
+	if !done {
+		dl.mgr.Cancel(dl.path)
+	}
 }
 
 // WaitForRange blocks until [offset, offset+size) is available in the cache,

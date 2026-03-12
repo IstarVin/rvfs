@@ -441,7 +441,9 @@ func (dh *downloadFileHandle) Read(ctx context.Context, dest []byte, off int64) 
 }
 
 func (dh *downloadFileHandle) Release(ctx context.Context) syscall.Errno {
-	if err := dh.f.Close(); err != nil {
+	err := dh.f.Close()
+	dh.dl.ReleaseReader()
+	if err != nil {
 		return toErrno(err)
 	}
 	return 0

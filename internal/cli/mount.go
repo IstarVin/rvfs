@@ -237,7 +237,7 @@ func init() {
 	mountRecoveryInterval = 2 * time.Second
 	mountCmd.Flags().Var((*durationValue)(&mountRecoveryInterval), "recovery-interval", "Probe interval while offline for faster reconnect detection (e.g. 2s)")
 
-	mountReadAhead = 256 * 1 << 20
+	mountReadAhead = 64 * 1024 * 1024
 	mountCmd.Flags().Var((*byteSizeValue)(&mountReadAhead), "read-ahead", "Bytes to download ahead of the read position; supports K/M/G suffixes (e.g. 256, 4K, 3M); 0 = unlimited")
 
 	mountIdleTimeout = 5
