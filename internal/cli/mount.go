@@ -29,7 +29,7 @@ var mountCmd = &cobra.Command{
 	Short: "Mount a local directory or remote via FUSE",
 	Long: `Mount a filesystem via FUSE.
 
-For local backing directory (Phase 1 compat):
+For local backing directory:
   rvfs mount /path/to/dir /mnt/point
 
 For a configured remote:
@@ -50,8 +50,8 @@ For a configured remote:
 		}
 
 		// Determine if source is a remote (contains ':') or a local path.
-		if idx := strings.Index(source, ":"); idx >= 0 {
-			return mountRemote(source[:idx], source[idx+1:], mountpoint, cacheDir)
+		if before, after, ok := strings.Cut(source, ":"); ok {
+			return mountRemote(before, after, mountpoint, cacheDir)
 		}
 		return mountLocal(source, mountpoint, cacheDir)
 	},
