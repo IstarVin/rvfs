@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -18,6 +19,10 @@ type Evictor struct {
 	// MaxAge is the maximum time since a clean file was last accessed before
 	// it is evicted regardless of space pressure. 0 means no age limit.
 	MaxAge time.Duration
+	// MinFreeSpace is the minimum free space that must remain on the
+	// filesystem containing the cache directory. Clean unpinned files are
+	// evicted (LRU-first) until the threshold is satisfied. 0 = disabled.
+	MinFreeSpace int64
 
 	// TriggerC is an optional channel the sync engine uses to nudge the
 	// evictor after every sync cycle. The evictor buffers and de-duplicates
@@ -48,10 +53,14 @@ func (ev *Evictor) Run(ctx context.Context, cl *CacheLayer) {
 	}
 }
 
-// check runs a single eviction pass: first by age, then by size.
+// check runs a single eviction pass: first by age, then by
+// minimum free space, then by size.
 func (ev *Evictor) check(cl *CacheLayer) {
 	if ev.MaxAge > 0 {
 		ev.evictByAge(cl)
+	}
+	if ev.MinFreeSpace > 0 {
+		ev.evictByFreeSpace(cl)
 	}
 	if ev.MaxSize > 0 {
 		ev.evictBySize(cl)
@@ -70,6 +79,34 @@ func (ev *Evictor) evictByAge(cl *CacheLayer) {
 			continue
 		}
 		evictEntry(cl, e)
+	}
+}
+
+// evictByFreeSpace removes the least-recently-accessed clean unpinned files
+// until the free space on the cache filesystem reaches MinFreeSpace.
+func (ev *Evictor) evictByFreeSpace(cl *CacheLayer) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(cl.filesDir, &st); err != nil {
+		return
+	}
+	// Available bytes for unprivileged processes.
+	avail := int64(st.Bavail) * st.Bsize
+	if avail >= ev.MinFreeSpace {
+		return
+	}
+
+	entries, err := cl.db.ListEvictable()
+	if err != nil {
+		return
+	}
+
+	for _, e := range entries {
+		if avail >= ev.MinFreeSpace {
+			break
+		}
+		freed := e.Size
+		evictEntry(cl, e)
+		avail += freed
 	}
 }
 

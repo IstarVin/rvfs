@@ -25,21 +25,22 @@ import (
 )
 
 var (
-	mountDebug            bool
-	mountForeground       bool
-	mountLogLevel         string
-	mountVerifyChecksums  bool
-	mountInstallService   bool
-	mountUninstallService bool
-	mountCacheDir         string
-	mountPollInterval     time.Duration
-	mountProbeInterval    time.Duration
-	mountRecoveryInterval time.Duration
-	mountReadAhead        int64
-	mountIdleTimeout      time.Duration
-	mountConflictStrategy string
-	mountCacheSize        int64
-	mountCacheMaxAge      time.Duration
+	mountDebug             bool
+	mountForeground        bool
+	mountLogLevel          string
+	mountVerifyChecksums   bool
+	mountInstallService    bool
+	mountUninstallService  bool
+	mountCacheDir          string
+	mountPollInterval      time.Duration
+	mountProbeInterval     time.Duration
+	mountRecoveryInterval  time.Duration
+	mountReadAhead         int64
+	mountIdleTimeout       time.Duration
+	mountConflictStrategy  string
+	mountCacheSize         int64
+	mountCacheMaxAge       time.Duration
+	mountCacheMinFreeSpace int64
 )
 
 var mountCmd = &cobra.Command{
@@ -96,6 +97,9 @@ For a configured remote:
 			if !cmd.Flags().Changed("cache-max-age") {
 				mountCacheMaxAge = mc.CacheMaxAge.D()
 			}
+			if !cmd.Flags().Changed("cache-min-free-space") {
+				mountCacheMinFreeSpace = mc.CacheMinFreeSpace.Int64()
+			}
 		}
 
 		cacheDir := mountCacheDir
@@ -124,6 +128,20 @@ For a configured remote:
 			logLevel = slog.LevelInfo
 		}
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+
+		// Check for duplicate mountpoint before daemonizing (fail fast with visible error).
+		absMountpoint, err := filepath.Abs(mountpoint)
+		if err != nil {
+			return fmt.Errorf("resolve mountpoint: %w", err)
+		}
+		reg, regErr := ipc.OpenMountRegistry()
+		if regErr == nil && reg != nil {
+			defer reg.Close()
+			if entry, alive, _ := reg.Lookup(absMountpoint); alive {
+				return fmt.Errorf("mountpoint %q is already in use (source: %s, pid: %d)",
+					absMountpoint, entry.Source, entry.PID)
+			}
+		}
 
 		// Daemonize by re-launching with --foreground unless already in foreground.
 		if !mountForeground {
@@ -305,7 +323,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	// Start LRU evictor.
 	evCtx, evCancel := context.WithCancel(context.Background())
 	defer evCancel()
-	ev := &cache.Evictor{MaxSize: mountCacheSize, MaxAge: mountCacheMaxAge}
+	ev := &cache.Evictor{MaxSize: mountCacheSize, MaxAge: mountCacheMaxAge, MinFreeSpace: mountCacheMinFreeSpace}
 	go ev.Run(evCtx, cl)
 
 	// Do an initial pull only when the local metadata DB is empty.
@@ -506,6 +524,8 @@ func init() {
 	mountCmd.Flags().Var((*byteSizeValue)(&mountCacheSize), "cache-size", "Maximum total cache size; evict clean files when exceeded (e.g. 10G, 500M); 0 = unlimited")
 
 	mountCmd.Flags().Var((*durationValue)(&mountCacheMaxAge), "cache-max-age", "Evict clean files not accessed for this long (e.g. 7d=168h, 30d=720h); 0 = disabled")
+
+	mountCmd.Flags().Var((*byteSizeValue)(&mountCacheMinFreeSpace), "cache-min-free-space", "Minimum free space to maintain on the cache filesystem; evict clean files when below this threshold (e.g. 1G, 500M); 0 = disabled")
 
 	mountCmd.Flags().BoolVar(&mountInstallService, "install-service", false, "Install OS service (systemd/launchd) to auto-start on login and exit")
 	mountCmd.Flags().BoolVar(&mountUninstallService, "uninstall-service", false, "Remove previously installed OS service and exit")

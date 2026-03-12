@@ -119,6 +119,10 @@ type MountConfig struct {
 	// CacheMaxAge evicts clean files that have not been accessed for longer
 	// than this duration. 0 means never evict by age.
 	CacheMaxAge Duration `toml:"cache_max_age"`
+	// CacheMinFreeSpace is the minimum free space that must remain on the
+	// filesystem containing the cache directory. Clean unpinned files are
+	// evicted until this threshold is satisfied. 0 means disabled.
+	CacheMinFreeSpace ByteSize `toml:"cache_min_free_space"`
 }
 
 // DefaultMountConfig returns a MountConfig pre-populated with the same
