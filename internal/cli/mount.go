@@ -44,6 +44,35 @@ For a configured remote:
 		source := args[0]
 		mountpoint := args[1]
 
+		// Apply config-file defaults for any flag the user did not explicitly set.
+		if globalCfg != nil {
+			mc := globalCfg.Mount
+			if !cmd.Flags().Changed("debug") {
+				mountDebug = mc.Debug
+			}
+			if !cmd.Flags().Changed("cache-dir") {
+				mountCacheDir = mc.CacheDir
+			}
+			if !cmd.Flags().Changed("poll-interval") {
+				mountPollInterval = mc.PollInterval.D()
+			}
+			if !cmd.Flags().Changed("probe-interval") {
+				mountProbeInterval = mc.ProbeInterval.D()
+			}
+			if !cmd.Flags().Changed("recovery-interval") {
+				mountRecoveryInterval = mc.RecoveryInterval.D()
+			}
+			if !cmd.Flags().Changed("read-ahead") {
+				mountReadAhead = mc.ReadAhead.Int64()
+			}
+			if !cmd.Flags().Changed("idle-timeout") {
+				mountIdleTimeout = mc.IdleTimeout.D()
+			}
+			if !cmd.Flags().Changed("conflict") {
+				mountConflictStrategy = mc.ConflictStrategy
+			}
+		}
+
 		cacheDir := mountCacheDir
 		if cacheDir == "" {
 			home, err := os.UserHomeDir()

@@ -3,6 +3,7 @@ module github.com/IstarVin/rvfs
 go 1.26.1
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
