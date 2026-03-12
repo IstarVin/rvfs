@@ -3,6 +3,9 @@ package cache
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func openTestDB(t *testing.T) *MetadataDB {
@@ -247,4 +250,216 @@ func TestPendingOpsLimit(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("limit: got %d want 2", len(got))
 	}
+}
+
+// ---------- HasFiles ----------
+
+func TestHasFilesEmpty(t *testing.T) {
+	db := openTestDB(t)
+	has, err := db.HasFiles()
+	require.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestHasFilesNonEmpty(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.PutFile(&FileEntry{Path: "a.txt", State: StateClean, Mode: 0100644}))
+	has, err := db.HasFiles()
+	require.NoError(t, err)
+	assert.True(t, has)
+}
+
+// ---------- CompletePendingOp ----------
+
+func TestCompletePendingOp(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Now().Unix()
+	require.NoError(t, db.AddPendingOp(&PendingOp{Op: "put", Path: "a.txt", QueuedAt: now}))
+	require.NoError(t, db.AddPendingOp(&PendingOp{Op: "delete", Path: "b.txt", QueuedAt: now}))
+
+	ops, err := db.NextPendingOps(10)
+	require.NoError(t, err)
+	require.Len(t, ops, 2)
+
+	require.NoError(t, db.CompletePendingOp(ops[0].ID))
+
+	remaining, err := db.NextPendingOps(10)
+	require.NoError(t, err)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "delete", remaining[0].Op)
+}
+
+// ---------- Transactions ----------
+
+func TestBeginTxCommit(t *testing.T) {
+	db := openTestDB(t)
+	tx, err := db.BeginTx()
+	require.NoError(t, err)
+
+	require.NoError(t, db.PutFileTx(tx, &FileEntry{
+		Path: "tx-file.txt", State: StateDirty, Mode: 0100644,
+	}))
+	require.NoError(t, db.AddPendingOpTx(tx, &PendingOp{
+		Op: "put", Path: "tx-file.txt", QueuedAt: time.Now().Unix(),
+	}))
+	require.NoError(t, tx.Commit())
+
+	got, err := db.GetFile("tx-file.txt")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, StateDirty, got.State)
+}
+
+func TestBeginTxRollback(t *testing.T) {
+	db := openTestDB(t)
+	tx, err := db.BeginTx()
+	require.NoError(t, err)
+
+	require.NoError(t, db.PutFileTx(tx, &FileEntry{
+		Path: "rollback.txt", State: StateDirty, Mode: 0100644,
+	}))
+	require.NoError(t, tx.Rollback())
+
+	got, err := db.GetFile("rollback.txt")
+	require.NoError(t, err)
+	assert.Nil(t, got, "file should not exist after rollback")
+}
+
+// ---------- DrivePathEntry CRUD ----------
+
+func TestPutGetDriveID(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.PutDriveID(&DrivePathEntry{
+		Path: "docs/readme.md", DriveID: "drive-abc-123",
+		ETag: "etag1", LastSeen: time.Now().Unix(),
+	}))
+	id, err := db.GetDriveID("docs/readme.md")
+	require.NoError(t, err)
+	assert.Equal(t, "drive-abc-123", id)
+}
+
+func TestGetDriveIDNotFound(t *testing.T) {
+	db := openTestDB(t)
+	id, err := db.GetDriveID("nonexistent")
+	require.NoError(t, err)
+	assert.Empty(t, id)
+}
+
+func TestPutDriveIDUpsert(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: "a.txt", DriveID: "old-id"}))
+	require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: "a.txt", DriveID: "new-id"}))
+	id, err := db.GetDriveID("a.txt")
+	require.NoError(t, err)
+	assert.Equal(t, "new-id", id)
+}
+
+func TestDeleteDriveID(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: "rm.txt", DriveID: "id1"}))
+	require.NoError(t, db.DeleteDriveID("rm.txt"))
+	id, err := db.GetDriveID("rm.txt")
+	require.NoError(t, err)
+	assert.Empty(t, id)
+}
+
+func TestDeleteDriveIDsByPrefix(t *testing.T) {
+	db := openTestDB(t)
+	for _, p := range []string{"dir/a.txt", "dir/b.txt", "dir/sub/c.txt", "other.txt"} {
+		require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: p, DriveID: "id-" + p}))
+	}
+	require.NoError(t, db.DeleteDriveIDsByPrefix("dir"))
+
+	for _, p := range []string{"dir/a.txt", "dir/b.txt", "dir/sub/c.txt"} {
+		id, err := db.GetDriveID(p)
+		require.NoError(t, err)
+		assert.Empty(t, id, "expected %s to be deleted", p)
+	}
+	id, err := db.GetDriveID("other.txt")
+	require.NoError(t, err)
+	assert.Equal(t, "id-other.txt", id)
+}
+
+// ---------- Conflicts CRUD ----------
+
+func TestAddListConflicts(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.AddConflict("a.txt", 100, 200))
+	require.NoError(t, db.AddConflict("b.txt", 300, 400))
+
+	conflicts, err := db.ListConflicts()
+	require.NoError(t, err)
+	require.Len(t, conflicts, 2)
+	assert.Equal(t, "a.txt", conflicts[0].Path)
+	assert.Equal(t, int64(100), conflicts[0].LocalMtime)
+	assert.Equal(t, int64(200), conflicts[0].RemoteMtime)
+	assert.Equal(t, "b.txt", conflicts[1].Path)
+}
+
+func TestGetConflict(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.AddConflict("test.txt", 100, 200))
+	conflicts, _ := db.ListConflicts()
+	require.Len(t, conflicts, 1)
+
+	got, err := db.GetConflict(conflicts[0].ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "test.txt", got.Path)
+}
+
+func TestGetConflictNotFound(t *testing.T) {
+	db := openTestDB(t)
+	got, err := db.GetConflict(9999)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestRemoveConflict(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.AddConflict("c.txt", 10, 20))
+	conflicts, _ := db.ListConflicts()
+	require.NoError(t, db.RemoveConflict(conflicts[0].ID))
+	remaining, err := db.ListConflicts()
+	require.NoError(t, err)
+	assert.Empty(t, remaining)
+}
+
+func TestRemoveConflictByPath(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.AddConflict("x.txt", 10, 20))
+	require.NoError(t, db.AddConflict("y.txt", 30, 40))
+	require.NoError(t, db.RemoveConflictByPath("x.txt"))
+	conflicts, err := db.ListConflicts()
+	require.NoError(t, err)
+	require.Len(t, conflicts, 1)
+	assert.Equal(t, "y.txt", conflicts[0].Path)
+}
+
+func TestRemoveAllConflicts(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.AddConflict("a.txt", 1, 2))
+	require.NoError(t, db.AddConflict("b.txt", 3, 4))
+	require.NoError(t, db.RemoveAllConflicts())
+	conflicts, err := db.ListConflicts()
+	require.NoError(t, err)
+	assert.Empty(t, conflicts)
+}
+
+func TestAddConflictUpsert(t *testing.T) {
+	db := openTestDB(t)
+	require.NoError(t, db.AddConflict("f.txt", 10, 20))
+	require.NoError(t, db.AddConflict("f.txt", 30, 40))
+	conflicts, err := db.ListConflicts()
+	require.NoError(t, err)
+	require.Len(t, conflicts, 1, "upsert should not create duplicate")
+	assert.Equal(t, int64(30), conflicts[0].LocalMtime)
+	assert.Equal(t, int64(40), conflicts[0].RemoteMtime)
+}
+
+func TestListConflictsEmpty(t *testing.T) {
+	db := openTestDB(t)
+	conflicts, err := db.ListConflicts()
+	require.NoError(t, err)
+	assert.Empty(t, conflicts)
 }

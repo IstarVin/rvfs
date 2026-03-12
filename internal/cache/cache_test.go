@@ -4,6 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func newTestCache(t *testing.T) *CacheLayer {
@@ -284,4 +288,144 @@ func TestCachePendingOpsChronological(t *testing.T) {
 			t.Fatalf("ops not in order: id[%d]=%d <= id[%d]=%d", i, ops[i].ID, i-1, ops[i-1].ID)
 		}
 	}
+}
+
+// ---------- Extended tests ----------
+
+func TestCacheChmod(t *testing.T) {
+	cl := newTestCache(t)
+
+	f, _, err := cl.Create("chmod.txt", 0644)
+	require.NoError(t, err)
+	f.Close()
+
+	require.NoError(t, cl.Chmod("chmod.txt", 0755))
+
+	entry, err := cl.Stat("chmod.txt")
+	require.NoError(t, err)
+	// The POSIX mode should include the new permission bits.
+	assert.Equal(t, os.FileMode(0755), os.FileMode(entry.Mode).Perm())
+}
+
+func TestCacheChtimes(t *testing.T) {
+	cl := newTestCache(t)
+
+	f, _, err := cl.Create("times.txt", 0644)
+	require.NoError(t, err)
+	f.Close()
+
+	now := time.Now().Truncate(time.Second)
+	require.NoError(t, cl.Chtimes("times.txt", now, now))
+
+	entry, err := cl.Stat("times.txt")
+	require.NoError(t, err)
+	assert.Equal(t, now.Unix(), entry.LocalMtime)
+}
+
+func TestCacheDeleteNonexistent(t *testing.T) {
+	cl := newTestCache(t)
+	err := cl.Delete("no-such-file.txt")
+	assert.Error(t, err)
+}
+
+func TestCacheRenameNonexistent(t *testing.T) {
+	cl := newTestCache(t)
+	err := cl.Rename("no-src.txt", "dst.txt")
+	assert.Error(t, err)
+}
+
+func TestCacheReadDirEmpty(t *testing.T) {
+	cl := newTestCache(t)
+	_, err := cl.Mkdir("empty", 0755)
+	require.NoError(t, err)
+
+	entries, err := cl.ReadDir("empty")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestCacheWriteAtOffset(t *testing.T) {
+	cl := newTestCache(t)
+
+	f, _, err := cl.Create("offset.txt", 0644)
+	require.NoError(t, err)
+	// Pre-fill with zeros.
+	f.Write(make([]byte, 20))
+	f.Close()
+	cl.Write("offset.txt", make([]byte, 20), 0)
+
+	// Write at offset 10.
+	data := []byte("HELLO")
+	n, err := cl.Write("offset.txt", data, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+
+	buf := make([]byte, 20)
+	nr, err := cl.Read("offset.txt", buf, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 20, nr)
+	assert.Equal(t, "HELLO", string(buf[10:15]))
+}
+
+func TestCacheSeedFromDirNested(t *testing.T) {
+	cl := newTestCache(t)
+
+	srcDir := t.TempDir()
+	os.MkdirAll(filepath.Join(srcDir, "a", "b", "c"), 0755)
+	os.WriteFile(filepath.Join(srcDir, "a", "b", "c", "deep.txt"), []byte("deep"), 0644)
+	os.WriteFile(filepath.Join(srcDir, "a", "top.txt"), []byte("top"), 0644)
+
+	require.NoError(t, cl.SeedFromDir(srcDir))
+
+	for _, p := range []string{"a", "a/b", "a/b/c", "a/b/c/deep.txt", "a/top.txt"} {
+		got, err := cl.Stat(p)
+		require.NoError(t, err, "path: %s", p)
+		assert.NotNil(t, got, "expected entry for %s", p)
+	}
+}
+
+func TestCacheSeedFromDirEmpty(t *testing.T) {
+	cl := newTestCache(t)
+	srcDir := t.TempDir()
+
+	require.NoError(t, cl.SeedFromDir(srcDir))
+
+	entries, err := cl.ReadDir("")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestCacheOpenOrCreate(t *testing.T) {
+	cl := newTestCache(t)
+
+	// Create new file.
+	f, err := cl.OpenOrCreate("new.bin", 1024)
+	require.NoError(t, err)
+	info, _ := f.Stat()
+	assert.Equal(t, int64(1024), info.Size())
+	f.Close()
+
+	// Reopen — should reuse existing file of same size.
+	f2, err := cl.OpenOrCreate("new.bin", 1024)
+	require.NoError(t, err)
+	f2.Close()
+}
+
+func TestCacheDiskPath(t *testing.T) {
+	cl := newTestCache(t)
+	p := cl.DiskPath("sub/file.txt")
+	assert.Contains(t, p, "files")
+	assert.Contains(t, p, "sub/file.txt")
+}
+
+func TestCacheLstatDisk(t *testing.T) {
+	cl := newTestCache(t)
+
+	f, _, err := cl.Create("stat.txt", 0644)
+	require.NoError(t, err)
+	f.Close()
+
+	st, err := cl.LstatDisk("stat.txt")
+	require.NoError(t, err)
+	assert.NotNil(t, st)
 }

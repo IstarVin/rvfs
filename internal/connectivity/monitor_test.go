@@ -199,3 +199,91 @@ func TestNotifyQueueDrainedIdempotent(t *testing.T) {
 		t.Fatalf("expected ONLINE after spurious NotifyQueueDrained, got %s", got)
 	}
 }
+
+// ---------- Extended tests ----------
+
+// TestSetRecoveryInterval verifies that SetRecoveryInterval is honoured while
+// OFFLINE, making probes fire at the shorter cadence.
+func TestSetRecoveryInterval(t *testing.T) {
+	// Fail immediately, then succeed after 1 probe at recovery pace.
+	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe, nil}}
+	mon := connectivity.New(adapter, 500*time.Millisecond, 3)
+	mon.SetRecoveryInterval(probeInterval) // much shorter recovery probes
+	sub := mon.Subscribe()
+	mon.Start()
+	defer mon.Stop()
+
+	waitForState(t, sub, connectivity.StateOffline)
+	// Because recovery interval is small, reconnection should arrive quickly
+	// even though the normal interval is 500ms.
+	waitForState(t, sub, connectivity.StateReconnecting)
+}
+
+// TestMultipleSubscribers ensures every subscriber receives transitions.
+func TestMultipleSubscribers(t *testing.T) {
+	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe}}
+	mon := connectivity.New(adapter, probeInterval, 3)
+	sub1 := mon.Subscribe()
+	sub2 := mon.Subscribe()
+	mon.Start()
+	defer mon.Stop()
+
+	waitForState(t, sub1, connectivity.StateOffline)
+	waitForState(t, sub2, connectivity.StateOffline)
+}
+
+// TestSlowSubscriberDrop ensures a slow subscriber does not block transitions.
+func TestSlowSubscriberDrop(t *testing.T) {
+	// 4 failures → offline; then 1 success → reconnecting;
+	// then more failures → offline again.
+	adapter := &mockAdapter{probes: []error{
+		errProbe, errProbe, errProbe, // → offline
+		nil,                          // → reconnecting
+		errProbe,                     // → offline again (threshold=1 during reconnecting)
+	}}
+	mon := connectivity.New(adapter, probeInterval, 3)
+	_ = mon.Subscribe() // intentionally never drained
+	fast := mon.Subscribe()
+	mon.Start()
+	defer mon.Stop()
+
+	// The fast subscriber should still see the offline transition even
+	// though the first subscriber is slow.
+	waitForState(t, fast, connectivity.StateOffline)
+}
+
+// TestRapidOnlineOffline cycles through OFFLINE → RECONNECTING → ONLINE
+// and back to OFFLINE.
+func TestRapidOnlineOffline(t *testing.T) {
+	adapter := &mockAdapter{probes: []error{
+		errProbe, errProbe, errProbe, // → OFFLINE
+		nil, // → RECONNECTING
+	}}
+	mon := connectivity.New(adapter, probeInterval, 3)
+	sub := mon.Subscribe()
+	mon.Start()
+	defer mon.Stop()
+
+	waitForState(t, sub, connectivity.StateOffline)
+	waitForState(t, sub, connectivity.StateReconnecting)
+	mon.NotifyQueueDrained()
+	waitForState(t, sub, connectivity.StateOnline)
+}
+
+// TestReconnectingToOfflineOnFailure ensures that a probe failure during
+// RECONNECTING transitions back to OFFLINE.
+func TestReconnectingToOfflineOnFailure(t *testing.T) {
+	adapter := &mockAdapter{probes: []error{
+		errProbe, errProbe, errProbe, // → OFFLINE
+		nil,      // → RECONNECTING
+		errProbe, // should go back to OFFLINE
+	}}
+	mon := connectivity.New(adapter, probeInterval, 3)
+	sub := mon.Subscribe()
+	mon.Start()
+	defer mon.Stop()
+
+	waitForState(t, sub, connectivity.StateOffline)
+	waitForState(t, sub, connectivity.StateReconnecting)
+	waitForState(t, sub, connectivity.StateOffline)
+}
