@@ -24,6 +24,7 @@ func newTestManager(t *testing.T, adapter *testutil.MockRemoteAdapter, opts Mana
 }
 
 func TestManagerStartAndWaitForRange(t *testing.T) {
+	t.Parallel()
 	content := bytes.Repeat([]byte("x"), 1024)
 	adapter := &testutil.MockRemoteAdapter{
 		GetFunc: func(path string, dest io.Writer) error {
@@ -50,6 +51,7 @@ func TestManagerStartAndWaitForRange(t *testing.T) {
 }
 
 func TestManagerStartDedup(t *testing.T) {
+	t.Parallel()
 	// Use a blocking Get so the download stays in-progress.
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
@@ -84,6 +86,7 @@ func TestManagerStartDedup(t *testing.T) {
 }
 
 func TestManagerIsDownloading(t *testing.T) {
+	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
 		GetFunc: func(path string, dest io.Writer) error {
@@ -114,6 +117,7 @@ func TestManagerIsDownloading(t *testing.T) {
 }
 
 func TestManagerCancel(t *testing.T) {
+	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
 		GetFunc: func(path string, dest io.Writer) error {
@@ -139,6 +143,7 @@ func TestManagerCancel(t *testing.T) {
 }
 
 func TestManagerWaitForRangeUnknownPath(t *testing.T) {
+	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{}
 	mgr, _ := newTestManager(t, adapter, ManagerOptions{})
 
@@ -148,6 +153,7 @@ func TestManagerWaitForRangeUnknownPath(t *testing.T) {
 }
 
 func TestManagerHintCachedNoop(t *testing.T) {
+	t.Parallel()
 	content := bytes.Repeat([]byte("y"), 512)
 	adapter := &testutil.MockRemoteAdapter{
 		GetFunc: func(path string, dest io.Writer) error {
@@ -174,6 +180,7 @@ func TestManagerHintCachedNoop(t *testing.T) {
 }
 
 func TestManagerAlreadyCached(t *testing.T) {
+	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{
 		GetFunc: func(path string, dest io.Writer) error {
 			return nil
@@ -206,4 +213,132 @@ func TestManagerAlreadyCached(t *testing.T) {
 	<-done
 
 	assert.False(t, mgr.IsDownloading("cached.bin"), "fully cached file should not remain in downloads")
+}
+
+// ---------- Extended tests ----------
+
+func TestManagerConcurrentStarts(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(path string, dest io.Writer) error {
+			close(started)
+			<-make(chan struct{})
+			return nil
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "race.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: 2048,
+	}))
+
+	// Launch multiple goroutines starting the same path concurrently.
+	const n = 10
+	type result struct {
+		dl  *Download
+		err error
+	}
+	results := make(chan result, n)
+
+	for range n {
+		go func() {
+			dl, f, err := mgr.Start("race.bin", 2048)
+			if f != nil {
+				f.Close()
+			}
+			results <- result{dl, err}
+		}()
+	}
+
+	// Wait for the download goroutine to actually start.
+	<-started
+
+	var downloads []*Download
+	for range n {
+		r := <-results
+		require.NoError(t, r.err)
+		downloads = append(downloads, r.dl)
+	}
+
+	// All should return the same Download instance.
+	for i := 1; i < len(downloads); i++ {
+		assert.Equal(t, downloads[0], downloads[i],
+			"goroutine %d got different Download instance", i)
+	}
+
+	mgr.Cancel("race.bin")
+}
+
+func TestManagerMultipleFiles(t *testing.T) {
+	t.Parallel()
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(path string, dest io.Writer) error {
+			_, err := dest.Write(bytes.Repeat([]byte("z"), 256))
+			return err
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	for _, name := range []string{"file1.bin", "file2.bin", "file3.bin"} {
+		require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+			Path: name, State: cache.StateEvicted, Mode: 0100644,
+			Size: 256,
+		}))
+	}
+
+	// Start all three downloads.
+	for _, name := range []string{"file1.bin", "file2.bin", "file3.bin"} {
+		_, f, err := mgr.Start(name, 256)
+		require.NoError(t, err)
+		f.Close()
+	}
+
+	// Wait for all to complete.
+	for _, name := range []string{"file1.bin", "file2.bin", "file3.bin"} {
+		require.NoError(t, mgr.WaitForRange(name, 0, 256))
+	}
+
+	// Give the download goroutines time to finish cleanup.
+	require.Eventually(t, func() bool {
+		for _, name := range []string{"file1.bin", "file2.bin", "file3.bin"} {
+			if mgr.IsDownloading(name) {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 10*time.Millisecond, "downloads should finish")
+}
+
+func TestManagerDownloadError(t *testing.T) {
+	t.Parallel()
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(path string, dest io.Writer) error {
+			return io.ErrUnexpectedEOF
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "err.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: 1024,
+	}))
+
+	_, f, err := mgr.Start("err.bin", 1024)
+	require.NoError(t, err)
+	defer f.Close()
+
+	err = mgr.WaitForRange("err.bin", 0, 1024)
+	assert.Error(t, err, "WaitForRange should propagate download error")
+}
+
+func TestManagerCancelIdempotent(t *testing.T) {
+	t.Parallel()
+	adapter := &testutil.MockRemoteAdapter{}
+	mgr, _ := newTestManager(t, adapter, ManagerOptions{})
+
+	// Cancel a path that was never started — should not panic.
+	mgr.Cancel("nonexistent.bin")
+	mgr.Cancel("nonexistent.bin")
 }

@@ -6,6 +6,9 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	rvfuse "github.com/IstarVin/rvfs/internal/fuse"
 )
 
@@ -20,14 +23,12 @@ func mountForTest(t *testing.T) string {
 	mountpoint := t.TempDir()
 
 	cl, server, err := rvfuse.Mount(cacheBase, "test", mountpoint, rvfuse.MountOptions{})
-	if err != nil {
-		t.Fatalf("Mount: %v", err)
-	}
+	require.NoError(t, err, "Mount")
 
 	// Seed the cache from the (empty) backing dir so the root dir entry exists.
 	if err := cl.SeedFromDir(backingDir); err != nil {
 		server.Unmount()
-		t.Fatalf("SeedFromDir: %v", err)
+		require.NoError(t, err, "SeedFromDir")
 	}
 
 	t.Cleanup(func() {
@@ -42,207 +43,148 @@ func mountForTest(t *testing.T) string {
 
 // TestCreateReadFile creates a file through the mount and reads it back.
 func TestCreateReadFile(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	path := filepath.Join(mnt, "hello.txt")
 	content := []byte("hello, rvfs!")
 
-	if err := os.WriteFile(path, content, 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, content, 0644))
 
 	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(got) != string(content) {
-		t.Fatalf("content mismatch: got %q want %q", got, content)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, string(content), string(got))
 }
 
 // TestStat verifies that stat returns sensible attributes for a file.
 func TestStat(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	path := filepath.Join(mnt, "stat.txt")
-	if err := os.WriteFile(path, []byte("data"), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0644))
 
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if info.Size() != 4 {
-		t.Fatalf("size: got %d want 4", info.Size())
-	}
-	if info.Mode().Perm() != 0644 {
-		t.Fatalf("mode: got %o want 0644", info.Mode().Perm())
-	}
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), info.Size())
+	assert.Equal(t, os.FileMode(0644), info.Mode().Perm())
 }
 
 // TestWriteFile tests overwriting file content.
 func TestWriteFile(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	path := filepath.Join(mnt, "write.txt")
-	if err := os.WriteFile(path, []byte("first"), 0644); err != nil {
-		t.Fatalf("first WriteFile: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("second"), 0644); err != nil {
-		t.Fatalf("second WriteFile: %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("first"), 0644))
+	require.NoError(t, os.WriteFile(path, []byte("second"), 0644))
 
 	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(got) != "second" {
-		t.Fatalf("content: got %q want %q", got, "second")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "second", string(got))
 }
 
 // TestTruncate verifies truncation via os.Truncate.
 func TestTruncate(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	path := filepath.Join(mnt, "trunc.txt")
-	if err := os.WriteFile(path, []byte("hello world"), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	if err := os.Truncate(path, 5); err != nil {
-		t.Fatalf("Truncate: %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("hello world"), 0644))
+	require.NoError(t, os.Truncate(path, 5))
 
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if info.Size() != 5 {
-		t.Fatalf("size after truncate: got %d want 5", info.Size())
-	}
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), info.Size())
 
 	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(got) != "hello" {
-		t.Fatalf("content after truncate: got %q want %q", got, "hello")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(got))
 }
 
 // TestRenameFile renames a file and verifies the old name is gone and new name exists.
 func TestRenameFile(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	src := filepath.Join(mnt, "src.txt")
 	dst := filepath.Join(mnt, "dst.txt")
 
-	if err := os.WriteFile(src, []byte("data"), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	if err := os.Rename(src, dst); err != nil {
-		t.Fatalf("Rename: %v", err)
-	}
+	require.NoError(t, os.WriteFile(src, []byte("data"), 0644))
+	require.NoError(t, os.Rename(src, dst))
 
-	if _, err := os.Stat(src); !os.IsNotExist(err) {
-		t.Fatalf("src still exists after rename")
-	}
+	_, err := os.Stat(src)
+	assert.True(t, os.IsNotExist(err), "src still exists after rename")
+
 	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("ReadFile dst: %v", err)
-	}
-	if string(got) != "data" {
-		t.Fatalf("content: got %q want %q", got, "data")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "data", string(got))
 }
 
 // TestUnlinkFile removes a file and verifies it's gone.
 func TestUnlinkFile(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	path := filepath.Join(mnt, "remove.txt")
-	if err := os.WriteFile(path, []byte("bye"), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("file still exists after remove")
-	}
+	require.NoError(t, os.WriteFile(path, []byte("bye"), 0644))
+	require.NoError(t, os.Remove(path))
+
+	_, err := os.Stat(path)
+	assert.True(t, os.IsNotExist(err), "file still exists after remove")
 }
 
 // TestMkdirReaddir creates a directory and reads its contents.
 func TestMkdirReaddir(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	dir := filepath.Join(mnt, "subdir")
-	if err := os.Mkdir(dir, 0755); err != nil {
-		t.Fatalf("Mkdir: %v", err)
-	}
+	require.NoError(t, os.Mkdir(dir, 0755))
 
 	// Create two files inside.
 	for _, name := range []string{"a.txt", "b.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0644); err != nil {
-			t.Fatalf("WriteFile %s: %v", name, err)
-		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(name), 0644))
 	}
 
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("ReadDir: got %d entries want 2", len(entries))
-	}
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
 
 	names := map[string]bool{}
 	for _, e := range entries {
 		names[e.Name()] = true
 	}
 	for _, want := range []string{"a.txt", "b.txt"} {
-		if !names[want] {
-			t.Fatalf("missing entry %q", want)
-		}
+		assert.True(t, names[want], "missing entry %q", want)
 	}
 }
 
 // TestRmdir removes an empty directory and verifies it's gone.
 func TestRmdir(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	dir := filepath.Join(mnt, "emptydir")
-	if err := os.Mkdir(dir, 0755); err != nil {
-		t.Fatalf("Mkdir: %v", err)
-	}
-	if err := os.Remove(dir); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("dir still exists after remove")
-	}
+	require.NoError(t, os.Mkdir(dir, 0755))
+	require.NoError(t, os.Remove(dir))
+
+	_, err := os.Stat(dir)
+	assert.True(t, os.IsNotExist(err), "dir still exists after remove")
 }
 
 // TestChmod verifies that file permissions can be changed via chmod.
 func TestChmod(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	path := filepath.Join(mnt, "chmod.txt")
-	if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("x"), 0644))
+	require.NoError(t, os.Chmod(path, 0600))
+
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if info.Mode().Perm() != 0600 {
-		t.Fatalf("perm: got %o want 0600", info.Mode().Perm())
-	}
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
 }
 
 // TestCpInodeStability copies a file through the mount and verifies the copy
@@ -251,6 +193,7 @@ func TestChmod(t *testing.T) {
 // (auto-assigned), go-fuse would assign new IDs after forget+recreate and cp
 // would detect an inode change mid-copy.
 func TestCpInodeStability(t *testing.T) {
+	t.Parallel()
 	mnt := mountForTest(t)
 
 	src := filepath.Join(mnt, "orig.bin")
@@ -260,47 +203,26 @@ func TestCpInodeStability(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i)
 	}
-	if err := os.WriteFile(src, data, 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	require.NoError(t, os.WriteFile(src, data, 0644))
 
 	// Record the inode number before and after a second stat.
 	stat1, err := os.Stat(src)
-	if err != nil {
-		t.Fatalf("Stat1: %v", err)
-	}
+	require.NoError(t, err)
 	stat2, err := os.Stat(src)
-	if err != nil {
-		t.Fatalf("Stat2: %v", err)
-	}
+	require.NoError(t, err)
 
 	ino1 := stat1.Sys().(*syscall.Stat_t).Ino
 	ino2 := stat2.Sys().(*syscall.Stat_t).Ino
-	if ino1 != ino2 {
-		t.Fatalf("inode changed between stats: %d → %d (FNV hash not stable?)", ino1, ino2)
-	}
+	assert.Equal(t, ino1, ino2, "inode should be stable between stats")
 
 	// Copy the file within the mount.
 	dst := filepath.Join(mnt, "copy.bin")
 	got, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if err := os.WriteFile(dst, got, 0644); err != nil {
-		t.Fatalf("WriteFile copy: %v", err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(dst, got, 0644))
 
 	// Verify the copy is identical.
 	copied, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("ReadFile copy: %v", err)
-	}
-	if len(copied) != len(data) {
-		t.Fatalf("copy size mismatch: got %d want %d", len(copied), len(data))
-	}
-	for i := range data {
-		if copied[i] != data[i] {
-			t.Fatalf("copy byte mismatch at offset %d", i)
-		}
-	}
+	require.NoError(t, err)
+	assert.Equal(t, data, copied)
 }

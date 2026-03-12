@@ -20,6 +20,7 @@ func openTestDB(t *testing.T) *MetadataDB {
 }
 
 func TestPutGetFile(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	e := &FileEntry{
@@ -32,90 +33,62 @@ func TestPutGetFile(t *testing.T) {
 		CachePath:   "/tmp/cache/files/docs/readme.md",
 		State:       StateDirty,
 	}
-	if err := db.PutFile(e); err != nil {
-		t.Fatalf("PutFile: %v", err)
-	}
+	require.NoError(t, db.PutFile(e))
 
 	got, err := db.GetFile("docs/readme.md")
-	if err != nil {
-		t.Fatalf("GetFile: %v", err)
-	}
-	if got == nil {
-		t.Fatal("GetFile returned nil")
-	}
-	if got.Size != 42 {
-		t.Fatalf("size: got %d want 42", got.Size)
-	}
-	if got.State != StateDirty {
-		t.Fatalf("state: got %q want %q", got.State, StateDirty)
-	}
-	if got.Mode != 0100644 {
-		t.Fatalf("mode: got %o want 0100644", got.Mode)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(42), got.Size)
+	assert.Equal(t, StateDirty, got.State)
+	assert.Equal(t, uint32(0100644), got.Mode)
 }
 
 func TestGetFileNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	got, err := db.GetFile("nonexistent")
-	if err != nil {
-		t.Fatalf("GetFile: %v", err)
-	}
-	if got != nil {
-		t.Fatal("expected nil for nonexistent path")
-	}
+	require.NoError(t, err)
+	assert.Nil(t, got, "expected nil for nonexistent path")
 }
 
 func TestPutFileUpsert(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	e := &FileEntry{Path: "a.txt", Size: 10, Mode: 0100644, State: StateClean}
-	if err := db.PutFile(e); err != nil {
-		t.Fatalf("PutFile: %v", err)
-	}
+	require.NoError(t, db.PutFile(e))
 
 	e.Size = 20
 	e.State = StateDirty
-	if err := db.PutFile(e); err != nil {
-		t.Fatalf("PutFile update: %v", err)
-	}
+	require.NoError(t, db.PutFile(e))
 
 	got, err := db.GetFile("a.txt")
-	if err != nil {
-		t.Fatalf("GetFile: %v", err)
-	}
-	if got.Size != 20 {
-		t.Fatalf("size after upsert: got %d want 20", got.Size)
-	}
-	if got.State != StateDirty {
-		t.Fatalf("state after upsert: got %q want %q", got.State, StateDirty)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, int64(20), got.Size)
+	assert.Equal(t, StateDirty, got.State)
 }
 
 func TestSetState(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
-	if err := db.PutFile(&FileEntry{Path: "f.txt", State: StateDirty, Mode: 0100644}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.SetState("f.txt", StateClean); err != nil {
-		t.Fatalf("SetState: %v", err)
-	}
+	require.NoError(t, db.PutFile(&FileEntry{Path: "f.txt", State: StateDirty, Mode: 0100644}))
+	require.NoError(t, db.SetState("f.txt", StateClean))
 
-	got, _ := db.GetFile("f.txt")
-	if got.State != StateClean {
-		t.Fatalf("state: got %q want %q", got.State, StateClean)
-	}
+	got, err := db.GetFile("f.txt")
+	require.NoError(t, err)
+	assert.Equal(t, StateClean, got.State)
 }
 
 func TestSetStateNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
-	if err := db.SetState("nope", StateClean); err == nil {
-		t.Fatal("expected error for missing path")
-	}
+	assert.Error(t, db.SetState("nope", StateClean))
 }
 
 func TestListDir(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	entries := []*FileEntry{
@@ -126,40 +99,27 @@ func TestListDir(t *testing.T) {
 		{Path: "sub/deep/c.txt", State: StateClean, Mode: 0100644},
 	}
 	for _, e := range entries {
-		if err := db.PutFile(e); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, db.PutFile(e))
 	}
 
 	// Root children
 	root, err := db.ListDir("")
-	if err != nil {
-		t.Fatalf("ListDir root: %v", err)
-	}
-	if len(root) != 2 { // a.txt and sub
-		t.Fatalf("root children: got %d want 2", len(root))
-	}
+	require.NoError(t, err)
+	assert.Len(t, root, 2, "root should have a.txt and sub")
 
 	// sub/ children
 	sub, err := db.ListDir("sub")
-	if err != nil {
-		t.Fatalf("ListDir sub: %v", err)
-	}
-	if len(sub) != 2 { // b.txt and deep
-		t.Fatalf("sub children: got %d want 2", len(sub))
-	}
+	require.NoError(t, err)
+	assert.Len(t, sub, 2, "sub should have b.txt and deep")
 
 	// sub/deep/ children
 	deep, err := db.ListDir("sub/deep")
-	if err != nil {
-		t.Fatalf("ListDir sub/deep: %v", err)
-	}
-	if len(deep) != 1 {
-		t.Fatalf("sub/deep children: got %d want 1", len(deep))
-	}
+	require.NoError(t, err)
+	assert.Len(t, deep, 1, "sub/deep should have c.txt")
 }
 
 func TestListByState(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	for _, e := range []*FileEntry{
@@ -167,36 +127,28 @@ func TestListByState(t *testing.T) {
 		{Path: "dirty1.txt", State: StateDirty, Mode: 0100644},
 		{Path: "dirty2.txt", State: StateDirty, Mode: 0100644},
 	} {
-		if err := db.PutFile(e); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, db.PutFile(e))
 	}
 
 	dirty, err := db.ListByState(StateDirty)
-	if err != nil {
-		t.Fatalf("ListByState: %v", err)
-	}
-	if len(dirty) != 2 {
-		t.Fatalf("dirty count: got %d want 2", len(dirty))
-	}
+	require.NoError(t, err)
+	assert.Len(t, dirty, 2)
 }
 
 func TestDeleteFile(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
-	if err := db.PutFile(&FileEntry{Path: "gone.txt", State: StateClean, Mode: 0100644}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.DeleteFile("gone.txt"); err != nil {
-		t.Fatalf("DeleteFile: %v", err)
-	}
-	got, _ := db.GetFile("gone.txt")
-	if got != nil {
-		t.Fatal("expected nil after delete")
-	}
+	require.NoError(t, db.PutFile(&FileEntry{Path: "gone.txt", State: StateClean, Mode: 0100644}))
+	require.NoError(t, db.DeleteFile("gone.txt"))
+
+	got, err := db.GetFile("gone.txt")
+	require.NoError(t, err)
+	assert.Nil(t, got, "expected nil after delete")
 }
 
 func TestPendingOpsOrdering(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	now := time.Now().Unix()
@@ -206,55 +158,42 @@ func TestPendingOpsOrdering(t *testing.T) {
 		{Op: "mkdir", Path: "dir", QueuedAt: now + 2},
 	}
 	for _, o := range ops {
-		if err := db.AddPendingOp(o); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, db.AddPendingOp(o))
 	}
 
 	got, err := db.NextPendingOps(10)
-	if err != nil {
-		t.Fatalf("NextPendingOps: %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("count: got %d want 3", len(got))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 3)
 	// Should be ordered by id (insertion order).
-	if got[0].Op != "put" || got[1].Op != "delete" || got[2].Op != "mkdir" {
-		t.Fatalf("order: %v", got)
-	}
+	assert.Equal(t, "put", got[0].Op)
+	assert.Equal(t, "delete", got[1].Op)
+	assert.Equal(t, "mkdir", got[2].Op)
 
 	// Complete the first op.
-	if err := db.CompletePendingOp(got[0].ID); err != nil {
-		t.Fatalf("CompletePendingOp: %v", err)
-	}
-	remaining, _ := db.NextPendingOps(10)
-	if len(remaining) != 2 {
-		t.Fatalf("remaining: got %d want 2", len(remaining))
-	}
+	require.NoError(t, db.CompletePendingOp(got[0].ID))
+	remaining, err := db.NextPendingOps(10)
+	require.NoError(t, err)
+	assert.Len(t, remaining, 2)
 }
 
 func TestPendingOpsLimit(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	now := time.Now().Unix()
 	for i := range 5 {
-		if err := db.AddPendingOp(&PendingOp{Op: "put", Path: "f" + string(rune('0'+i)), QueuedAt: now}); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, db.AddPendingOp(&PendingOp{Op: "put", Path: "f" + string(rune('0'+i)), QueuedAt: now}))
 	}
 
 	got, err := db.NextPendingOps(2)
-	if err != nil {
-		t.Fatalf("NextPendingOps: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("limit: got %d want 2", len(got))
-	}
+	require.NoError(t, err)
+	assert.Len(t, got, 2)
 }
 
 // ---------- HasFiles ----------
 
 func TestHasFilesEmpty(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	has, err := db.HasFiles()
 	require.NoError(t, err)
@@ -262,6 +201,7 @@ func TestHasFilesEmpty(t *testing.T) {
 }
 
 func TestHasFilesNonEmpty(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.PutFile(&FileEntry{Path: "a.txt", State: StateClean, Mode: 0100644}))
 	has, err := db.HasFiles()
@@ -272,6 +212,7 @@ func TestHasFilesNonEmpty(t *testing.T) {
 // ---------- CompletePendingOp ----------
 
 func TestCompletePendingOp(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	now := time.Now().Unix()
 	require.NoError(t, db.AddPendingOp(&PendingOp{Op: "put", Path: "a.txt", QueuedAt: now}))
@@ -292,6 +233,7 @@ func TestCompletePendingOp(t *testing.T) {
 // ---------- Transactions ----------
 
 func TestBeginTxCommit(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	tx, err := db.BeginTx()
 	require.NoError(t, err)
@@ -311,6 +253,7 @@ func TestBeginTxCommit(t *testing.T) {
 }
 
 func TestBeginTxRollback(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	tx, err := db.BeginTx()
 	require.NoError(t, err)
@@ -328,6 +271,7 @@ func TestBeginTxRollback(t *testing.T) {
 // ---------- DrivePathEntry CRUD ----------
 
 func TestPutGetDriveID(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.PutDriveID(&DrivePathEntry{
 		Path: "docs/readme.md", DriveID: "drive-abc-123",
@@ -339,6 +283,7 @@ func TestPutGetDriveID(t *testing.T) {
 }
 
 func TestGetDriveIDNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	id, err := db.GetDriveID("nonexistent")
 	require.NoError(t, err)
@@ -346,6 +291,7 @@ func TestGetDriveIDNotFound(t *testing.T) {
 }
 
 func TestPutDriveIDUpsert(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: "a.txt", DriveID: "old-id"}))
 	require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: "a.txt", DriveID: "new-id"}))
@@ -355,6 +301,7 @@ func TestPutDriveIDUpsert(t *testing.T) {
 }
 
 func TestDeleteDriveID(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: "rm.txt", DriveID: "id1"}))
 	require.NoError(t, db.DeleteDriveID("rm.txt"))
@@ -364,6 +311,7 @@ func TestDeleteDriveID(t *testing.T) {
 }
 
 func TestDeleteDriveIDsByPrefix(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	for _, p := range []string{"dir/a.txt", "dir/b.txt", "dir/sub/c.txt", "other.txt"} {
 		require.NoError(t, db.PutDriveID(&DrivePathEntry{Path: p, DriveID: "id-" + p}))
@@ -383,6 +331,7 @@ func TestDeleteDriveIDsByPrefix(t *testing.T) {
 // ---------- Conflicts CRUD ----------
 
 func TestAddListConflicts(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.AddConflict("a.txt", 100, 200))
 	require.NoError(t, db.AddConflict("b.txt", 300, 400))
@@ -397,6 +346,7 @@ func TestAddListConflicts(t *testing.T) {
 }
 
 func TestGetConflict(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.AddConflict("test.txt", 100, 200))
 	conflicts, _ := db.ListConflicts()
@@ -409,6 +359,7 @@ func TestGetConflict(t *testing.T) {
 }
 
 func TestGetConflictNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	got, err := db.GetConflict(9999)
 	require.NoError(t, err)
@@ -416,6 +367,7 @@ func TestGetConflictNotFound(t *testing.T) {
 }
 
 func TestRemoveConflict(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.AddConflict("c.txt", 10, 20))
 	conflicts, _ := db.ListConflicts()
@@ -426,6 +378,7 @@ func TestRemoveConflict(t *testing.T) {
 }
 
 func TestRemoveConflictByPath(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.AddConflict("x.txt", 10, 20))
 	require.NoError(t, db.AddConflict("y.txt", 30, 40))
@@ -437,6 +390,7 @@ func TestRemoveConflictByPath(t *testing.T) {
 }
 
 func TestRemoveAllConflicts(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.AddConflict("a.txt", 1, 2))
 	require.NoError(t, db.AddConflict("b.txt", 3, 4))
@@ -447,6 +401,7 @@ func TestRemoveAllConflicts(t *testing.T) {
 }
 
 func TestAddConflictUpsert(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	require.NoError(t, db.AddConflict("f.txt", 10, 20))
 	require.NoError(t, db.AddConflict("f.txt", 30, 40))
@@ -458,6 +413,7 @@ func TestAddConflictUpsert(t *testing.T) {
 }
 
 func TestListConflictsEmpty(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	conflicts, err := db.ListConflicts()
 	require.NoError(t, err)

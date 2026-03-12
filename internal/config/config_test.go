@@ -16,6 +16,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestLoadMissingFile(t *testing.T) {
+	t.Parallel()
 	cfg, err := Load(filepath.Join(t.TempDir(), "nonexistent.toml"))
 	require.NoError(t, err)
 	assert.NotNil(t, cfg.Remotes)
@@ -23,6 +24,7 @@ func TestLoadMissingFile(t *testing.T) {
 }
 
 func TestLoadInvalidTOML(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "bad.toml")
 	require.NoError(t, os.WriteFile(path, []byte("[[not valid toml"), 0644))
 
@@ -32,6 +34,7 @@ func TestLoadInvalidTOML(t *testing.T) {
 }
 
 func TestSaveLoadRoundTrip(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 
 	original := &Config{
@@ -74,6 +77,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 }
 
 func TestSaveCreatesParentDirs(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "deep", "nested", "config.toml")
 
 	cfg := &Config{Remotes: map[string]RemoteConfig{}}
@@ -84,6 +88,7 @@ func TestSaveCreatesParentDirs(t *testing.T) {
 }
 
 func TestSavePermissions(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 
 	cfg := &Config{Remotes: map[string]RemoteConfig{}}
@@ -95,6 +100,7 @@ func TestSavePermissions(t *testing.T) {
 }
 
 func TestSaveAtomicity(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 
 	cfg := &Config{Remotes: map[string]RemoteConfig{
@@ -108,6 +114,7 @@ func TestSaveAtomicity(t *testing.T) {
 }
 
 func TestLoadEmptyRemotes(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 	require.NoError(t, os.WriteFile(path, []byte("[remotes]\n"), 0644))
 
@@ -118,6 +125,7 @@ func TestLoadEmptyRemotes(t *testing.T) {
 }
 
 func TestSaveProducesValidTOML(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 
 	cfg := &Config{Remotes: map[string]RemoteConfig{
@@ -134,6 +142,7 @@ func TestSaveProducesValidTOML(t *testing.T) {
 }
 
 func TestSaveOverwritesExisting(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 
 	cfg1 := &Config{Remotes: map[string]RemoteConfig{"old": {Type: "gdrive"}}}
@@ -153,6 +162,7 @@ func TestSaveOverwritesExisting(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDefaultPathNotEmpty(t *testing.T) {
+	t.Parallel()
 	p := DefaultPath()
 	assert.NotEmpty(t, p)
 	assert.Contains(t, p, "rvfs")
@@ -160,6 +170,7 @@ func TestDefaultPathNotEmpty(t *testing.T) {
 }
 
 func TestTokenPathContainsRemoteName(t *testing.T) {
+	t.Parallel()
 	p := TokenPath("myremote")
 	assert.Contains(t, p, "myremote.json")
 	assert.Contains(t, p, "tokens")
@@ -170,6 +181,7 @@ func TestTokenPathContainsRemoteName(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDefaultsPopulatedOnMissingFile(t *testing.T) {
+	t.Parallel()
 	cfg, err := Load(filepath.Join(t.TempDir(), "nonexistent.toml"))
 	require.NoError(t, err)
 
@@ -186,6 +198,7 @@ func TestDefaultsPopulatedOnMissingFile(t *testing.T) {
 }
 
 func TestPartialMountConfigPreservesDefaults(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 	// Only override poll_interval; everything else should remain at defaults.
 	require.NoError(t, os.WriteFile(path, []byte(`
@@ -207,6 +220,7 @@ poll_interval = "5m"
 // ---------------------------------------------------------------------------
 
 func TestDurationMarshalRoundTrip(t *testing.T) {
+	t.Parallel()
 	cases := []time.Duration{
 		0,
 		5 * time.Nanosecond,
@@ -226,12 +240,14 @@ func TestDurationMarshalRoundTrip(t *testing.T) {
 }
 
 func TestDurationUnmarshalCaseInsensitive(t *testing.T) {
+	t.Parallel()
 	var d Duration
 	require.NoError(t, d.UnmarshalText([]byte("30S")))
 	assert.Equal(t, Duration(30*time.Second), d)
 }
 
 func TestDurationUnmarshalInvalid(t *testing.T) {
+	t.Parallel()
 	var d Duration
 	err := d.UnmarshalText([]byte("notaduration"))
 	assert.Error(t, err)
@@ -242,6 +258,7 @@ func TestDurationUnmarshalInvalid(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestByteSizeMarshalRoundTrip(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		size    ByteSize
 		wantStr string
@@ -264,6 +281,7 @@ func TestByteSizeMarshalRoundTrip(t *testing.T) {
 }
 
 func TestByteSizeUnmarshalSuffixes(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		input string
 		want  ByteSize
@@ -283,6 +301,7 @@ func TestByteSizeUnmarshalSuffixes(t *testing.T) {
 }
 
 func TestByteSizeUnmarshalInvalid(t *testing.T) {
+	t.Parallel()
 	var b ByteSize
 	err := b.UnmarshalText([]byte("notasize"))
 	assert.Error(t, err)
@@ -293,6 +312,7 @@ func TestByteSizeUnmarshalInvalid(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLogConfigRoundTrip(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.toml")
 
 	original := &Config{

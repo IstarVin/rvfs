@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/remote"
 )
@@ -61,7 +64,7 @@ func waitForState(t *testing.T, sub <-chan connectivity.ConnState, want connecti
 				return
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for state %s", want)
+			require.Fail(t, "timed out waiting for state", "wanted %s", want)
 		}
 	}
 }
@@ -69,6 +72,7 @@ func waitForState(t *testing.T, sub <-chan connectivity.ConnState, want connecti
 // TestThresholdFailures ensures exactly threshold consecutive failures are
 // required before transitioning ONLINE -> OFFLINE.
 func TestThresholdFailures(t *testing.T) {
+	t.Parallel()
 	const threshold = 3
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe}}
 	mon := connectivity.New(adapter, probeInterval, threshold)
@@ -77,15 +81,13 @@ func TestThresholdFailures(t *testing.T) {
 	defer mon.Stop()
 
 	waitForState(t, sub, connectivity.StateOffline)
-
-	if got := mon.State(); got != connectivity.StateOffline {
-		t.Fatalf("expected OFFLINE after threshold, got %s", got)
-	}
+	assert.Equal(t, connectivity.StateOffline, mon.State())
 }
 
 // TestContextCancelledOnOffline ensures the monitor context is cancelled when
 // transitioning to OFFLINE.
 func TestContextCancelledOnOffline(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe}}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	ctx := mon.Context()
@@ -99,13 +101,14 @@ func TestContextCancelledOnOffline(t *testing.T) {
 	case <-ctx.Done():
 	// good
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("context not cancelled after OFFLINE transition")
+		require.Fail(t, "context not cancelled after OFFLINE transition")
 	}
 }
 
 // TestOfflineToReconnecting ensures a successful probe after OFFLINE
 // transitions to RECONNECTING with a fresh (non-cancelled) context.
 func TestOfflineToReconnecting(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe, nil}}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	sub := mon.Subscribe()
@@ -115,13 +118,11 @@ func TestOfflineToReconnecting(t *testing.T) {
 	waitForState(t, sub, connectivity.StateOffline)
 	waitForState(t, sub, connectivity.StateReconnecting)
 
-	if got := mon.State(); got != connectivity.StateReconnecting {
-		t.Fatalf("expected RECONNECTING, got %s", got)
-	}
+	assert.Equal(t, connectivity.StateReconnecting, mon.State())
 	ctx := mon.Context()
 	select {
 	case <-ctx.Done():
-		t.Fatal("new context should not be cancelled in RECONNECTING state")
+		require.Fail(t, "new context should not be cancelled in RECONNECTING state")
 	default:
 		// good
 	}
@@ -130,6 +131,7 @@ func TestOfflineToReconnecting(t *testing.T) {
 // TestNotifyQueueDrained ensures RECONNECTING -> ONLINE after the engine
 // signals that the dirty queue has been flushed.
 func TestNotifyQueueDrained(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe, nil}}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	sub := mon.Subscribe()
@@ -143,21 +145,18 @@ func TestNotifyQueueDrained(t *testing.T) {
 
 	select {
 	case got := <-sub:
-		if got != connectivity.StateOnline {
-			t.Fatalf("expected ONLINE after NotifyQueueDrained, got %s", got)
-		}
+		assert.Equal(t, connectivity.StateOnline, got)
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("timed out waiting for ONLINE after NotifyQueueDrained")
+		require.Fail(t, "timed out waiting for ONLINE after NotifyQueueDrained")
 	}
 
-	if got := mon.State(); got != connectivity.StateOnline {
-		t.Fatalf("State() should be ONLINE, got %s", got)
-	}
+	assert.Equal(t, connectivity.StateOnline, mon.State())
 }
 
 // TestSubscribeReceivesAllTransitions ensures subscriber sees OFFLINE then
 // RECONNECTING in order.
 func TestSubscribeReceivesAllTransitions(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe, nil}}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	sub := mon.Subscribe()
@@ -171,6 +170,7 @@ func TestSubscribeReceivesAllTransitions(t *testing.T) {
 
 // TestStopNoGoroutineLeak ensures Stop() returns promptly.
 func TestStopNoGoroutineLeak(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	mon.Start()
@@ -185,22 +185,21 @@ func TestStopNoGoroutineLeak(t *testing.T) {
 	case <-done:
 	// good
 	case <-time.After(1 * time.Second):
-		t.Fatal("Stop() did not return promptly")
+		require.Fail(t, "Stop() did not return promptly")
 	}
 }
 
 // TestNotifyQueueDrainedIdempotent ensures calling NotifyQueueDrained from a
 // non-RECONNECTING state is a no-op.
 func TestNotifyQueueDrainedIdempotent(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	mon.Start()
 	defer mon.Stop()
 
 	mon.NotifyQueueDrained()
-	if got := mon.State(); got != connectivity.StateOnline {
-		t.Fatalf("expected ONLINE after spurious NotifyQueueDrained, got %s", got)
-	}
+	assert.Equal(t, connectivity.StateOnline, mon.State())
 }
 
 // ---------- Extended tests ----------
@@ -208,6 +207,7 @@ func TestNotifyQueueDrainedIdempotent(t *testing.T) {
 // TestSetRecoveryInterval verifies that SetRecoveryInterval is honoured while
 // OFFLINE, making probes fire at the shorter cadence.
 func TestSetRecoveryInterval(t *testing.T) {
+	t.Parallel()
 	// Fail immediately, then succeed after 1 probe at recovery pace.
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe, nil}}
 	mon := connectivity.New(adapter, 500*time.Millisecond, 3)
@@ -224,6 +224,7 @@ func TestSetRecoveryInterval(t *testing.T) {
 
 // TestMultipleSubscribers ensures every subscriber receives transitions.
 func TestMultipleSubscribers(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{errProbe, errProbe, errProbe}}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	sub1 := mon.Subscribe()
@@ -237,6 +238,7 @@ func TestMultipleSubscribers(t *testing.T) {
 
 // TestSlowSubscriberDrop ensures a slow subscriber does not block transitions.
 func TestSlowSubscriberDrop(t *testing.T) {
+	t.Parallel()
 	// 4 failures → offline; then 1 success → reconnecting;
 	// then more failures → offline again.
 	adapter := &mockAdapter{probes: []error{
@@ -258,6 +260,7 @@ func TestSlowSubscriberDrop(t *testing.T) {
 // TestRapidOnlineOffline cycles through OFFLINE → RECONNECTING → ONLINE
 // and back to OFFLINE.
 func TestRapidOnlineOffline(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{
 		errProbe, errProbe, errProbe, // → OFFLINE
 		nil, // → RECONNECTING
@@ -276,6 +279,7 @@ func TestRapidOnlineOffline(t *testing.T) {
 // TestReconnectingToOfflineOnFailure ensures that a probe failure during
 // RECONNECTING transitions back to OFFLINE.
 func TestReconnectingToOfflineOnFailure(t *testing.T) {
+	t.Parallel()
 	adapter := &mockAdapter{probes: []error{
 		errProbe, errProbe, errProbe, // → OFFLINE
 		nil,      // → RECONNECTING

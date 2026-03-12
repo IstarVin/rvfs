@@ -25,6 +25,7 @@ func newTestCacheLayer(t *testing.T) *cache.CacheLayer {
 // ---------- ValidConflictStrategy ----------
 
 func TestValidConflictStrategy(t *testing.T) {
+	t.Parallel()
 	for _, s := range []string{"both", "local-wins", "remote-wins", "manual"} {
 		assert.True(t, ValidConflictStrategy(s), "should be valid: %s", s)
 	}
@@ -36,6 +37,7 @@ func TestValidConflictStrategy(t *testing.T) {
 // ---------- Resolve: local-wins ----------
 
 func TestResolveLocalWins(t *testing.T) {
+	t.Parallel()
 	cl := newTestCacheLayer(t)
 	adapter := &testutil.MockRemoteAdapter{}
 	resolver := NewResolver(StrategyLocalWins, cl, adapter)
@@ -63,6 +65,7 @@ func TestResolveLocalWins(t *testing.T) {
 // ---------- Resolve: remote-wins ----------
 
 func TestResolveRemoteWins(t *testing.T) {
+	t.Parallel()
 	cl := newTestCacheLayer(t)
 	remoteContent := []byte("remote content here")
 	adapter := &testutil.MockRemoteAdapter{GetData: remoteContent}
@@ -99,6 +102,7 @@ func TestResolveRemoteWins(t *testing.T) {
 }
 
 func TestResolveRemoteWinsDownloadFailure(t *testing.T) {
+	t.Parallel()
 	cl := newTestCacheLayer(t)
 	adapter := &testutil.MockRemoteAdapter{GetErr: errors.New("network error")}
 	resolver := NewResolver(StrategyRemoteWins, cl, adapter)
@@ -119,6 +123,7 @@ func TestResolveRemoteWinsDownloadFailure(t *testing.T) {
 // ---------- Resolve: both ----------
 
 func TestResolveBoth(t *testing.T) {
+	t.Parallel()
 	cl := newTestCacheLayer(t)
 	remoteContent := []byte("remote version")
 	adapter := &testutil.MockRemoteAdapter{GetData: remoteContent}
@@ -159,6 +164,7 @@ func TestResolveBoth(t *testing.T) {
 }
 
 func TestResolveBothDownloadFailure(t *testing.T) {
+	t.Parallel()
 	cl := newTestCacheLayer(t)
 	adapter := &testutil.MockRemoteAdapter{GetErr: errors.New("timeout")}
 	resolver := NewResolver(StrategyBoth, cl, adapter)
@@ -187,6 +193,7 @@ func TestResolveBothDownloadFailure(t *testing.T) {
 // ---------- Resolve: manual ----------
 
 func TestResolveManual(t *testing.T) {
+	t.Parallel()
 	cl := newTestCacheLayer(t)
 	adapter := &testutil.MockRemoteAdapter{}
 	resolver := NewResolver(StrategyManual, cl, adapter)

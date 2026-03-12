@@ -3,104 +3,94 @@ package download
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAddSingle(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
-	if got := rs.Len(); got != 1 {
-		t.Fatalf("expected 1 interval, got %d", got)
-	}
+	require.Equal(t, 1, rs.Len())
 	iv := rs.Intervals()[0]
-	if iv.Start != 0 || iv.End != 100 {
-		t.Fatalf("unexpected interval: %v", iv)
-	}
+	assert.Equal(t, int64(0), iv.Start)
+	assert.Equal(t, int64(100), iv.End)
 }
 
 func TestAddNonOverlapping(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 	rs.Add(200, 100) // [0,100) [200,300)
-	if got := rs.Len(); got != 2 {
-		t.Fatalf("expected 2 intervals, got %d", got)
-	}
+	assert.Equal(t, 2, rs.Len())
 }
 
 func TestAddAdjacent(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 	rs.Add(100, 100) // should merge into [0,200)
-	if got := rs.Len(); got != 1 {
-		t.Fatalf("expected 1 interval after merge, got %d", got)
-	}
+	require.Equal(t, 1, rs.Len())
 	iv := rs.Intervals()[0]
-	if iv.Start != 0 || iv.End != 200 {
-		t.Fatalf("unexpected merged interval: %v", iv)
-	}
+	assert.Equal(t, int64(0), iv.Start)
+	assert.Equal(t, int64(200), iv.End)
 }
 
 func TestAddOverlapping(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 	rs.Add(50, 100) // overlap → [0,150)
-	if got := rs.Len(); got != 1 {
-		t.Fatalf("expected 1 interval, got %d", got)
-	}
+	require.Equal(t, 1, rs.Len())
 	iv := rs.Intervals()[0]
-	if iv.Start != 0 || iv.End != 150 {
-		t.Fatalf("unexpected merged interval: %v", iv)
-	}
+	assert.Equal(t, int64(0), iv.Start)
+	assert.Equal(t, int64(150), iv.End)
 }
 
 func TestAddMergeMultiple(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 	rs.Add(200, 100)
 	rs.Add(400, 100)
 	// Now bridge [0-100) and [200-300) and [400-500)
 	rs.Add(50, 450) // should merge all into [0,500)
-	if got := rs.Len(); got != 1 {
-		t.Fatalf("expected 1 interval, got %d", got)
-	}
+	require.Equal(t, 1, rs.Len())
 	iv := rs.Intervals()[0]
-	if iv.Start != 0 || iv.End != 500 {
-		t.Fatalf("unexpected merged interval: %v", iv)
-	}
+	assert.Equal(t, int64(0), iv.Start)
+	assert.Equal(t, int64(500), iv.End)
 }
 
 func TestAddZeroLength(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 0)
-	if got := rs.Len(); got != 0 {
-		t.Fatalf("expected 0 intervals, got %d", got)
-	}
+	assert.Equal(t, 0, rs.Len())
 }
 
 func TestAddNegativeLength(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, -5)
-	if got := rs.Len(); got != 0 {
-		t.Fatalf("expected 0 intervals, got %d", got)
-	}
+	assert.Equal(t, 0, rs.Len())
 }
 
 func TestAddInsertBefore(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(200, 100)
 	rs.Add(0, 50) // insert before existing
-	if got := rs.Len(); got != 2 {
-		t.Fatalf("expected 2 intervals, got %d", got)
-	}
+	require.Equal(t, 2, rs.Len())
 	ivs := rs.Intervals()
-	if ivs[0].Start != 0 || ivs[0].End != 50 {
-		t.Fatalf("first interval wrong: %v", ivs[0])
-	}
-	if ivs[1].Start != 200 || ivs[1].End != 300 {
-		t.Fatalf("second interval wrong: %v", ivs[1])
-	}
+	assert.Equal(t, int64(0), ivs[0].Start)
+	assert.Equal(t, int64(50), ivs[0].End)
+	assert.Equal(t, int64(200), ivs[1].Start)
+	assert.Equal(t, int64(300), ivs[1].End)
 }
 
 func TestContains(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 	rs.Add(200, 100)
@@ -121,32 +111,24 @@ func TestContains(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got := rs.Contains(tc.off, tc.len)
-		if got != tc.want {
-			t.Errorf("Contains(%d, %d) = %v, want %v", tc.off, tc.len, got, tc.want)
-		}
+		assert.Equal(t, tc.want, rs.Contains(tc.off, tc.len),
+			"Contains(%d, %d)", tc.off, tc.len)
 	}
 }
 
 func TestIsComplete(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 
-	if !rs.IsComplete(100) {
-		t.Error("expected complete for totalSize=100")
-	}
-	if !rs.IsComplete(50) {
-		t.Error("expected complete for totalSize=50")
-	}
-	if rs.IsComplete(101) {
-		t.Error("expected incomplete for totalSize=101")
-	}
-	if !rs.IsComplete(0) {
-		t.Error("expected complete for totalSize=0")
-	}
+	assert.True(t, rs.IsComplete(100), "totalSize=100")
+	assert.True(t, rs.IsComplete(50), "totalSize=50")
+	assert.False(t, rs.IsComplete(101), "totalSize=101")
+	assert.True(t, rs.IsComplete(0), "totalSize=0")
 }
 
 func TestGaps(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(10, 20) // [10,30)
 	rs.Add(50, 10) // [50,60)
@@ -157,102 +139,73 @@ func TestGaps(t *testing.T) {
 		{30, 50},
 		{60, 100},
 	}
-	if len(gaps) != len(expected) {
-		t.Fatalf("expected %d gaps, got %d: %v", len(expected), len(gaps), gaps)
-	}
+	require.Len(t, gaps, len(expected))
 	for i, g := range gaps {
-		if g != expected[i] {
-			t.Errorf("gap[%d] = %v, want %v", i, g, expected[i])
-		}
+		assert.Equal(t, expected[i], g, "gap[%d]", i)
 	}
 }
 
 func TestGapsComplete(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 100)
 	gaps := rs.Gaps(100)
-	if len(gaps) != 0 {
-		t.Fatalf("expected no gaps, got %v", gaps)
-	}
+	assert.Empty(t, gaps)
 }
 
 func TestGapsEmpty(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	gaps := rs.Gaps(100)
-	if len(gaps) != 1 || gaps[0].Start != 0 || gaps[0].End != 100 {
-		t.Fatalf("expected single gap [0,100), got %v", gaps)
-	}
+	require.Len(t, gaps, 1)
+	assert.Equal(t, int64(0), gaps[0].Start)
+	assert.Equal(t, int64(100), gaps[0].End)
 }
 
 func TestJSONRoundTrip(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 1024)
 	rs.Add(4096, 4096)
 
 	data, err := json.Marshal(rs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expected := `[[0,1024],[4096,8192]]`
-	if string(data) != expected {
-		t.Fatalf("JSON = %s, want %s", data, expected)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, `[[0,1024],[4096,8192]]`, string(data))
 
 	rs2 := NewRangeSet()
-	if err := json.Unmarshal(data, rs2); err != nil {
-		t.Fatal(err)
-	}
-	if rs2.Len() != 2 {
-		t.Fatalf("expected 2 intervals after unmarshal, got %d", rs2.Len())
-	}
+	require.NoError(t, json.Unmarshal(data, rs2))
+	require.Equal(t, 2, rs2.Len())
 	ivs := rs2.Intervals()
-	if ivs[0].Start != 0 || ivs[0].End != 1024 {
-		t.Fatalf("first interval wrong: %v", ivs[0])
-	}
-	if ivs[1].Start != 4096 || ivs[1].End != 8192 {
-		t.Fatalf("second interval wrong: %v", ivs[1])
-	}
+	assert.Equal(t, int64(0), ivs[0].Start)
+	assert.Equal(t, int64(1024), ivs[0].End)
+	assert.Equal(t, int64(4096), ivs[1].Start)
+	assert.Equal(t, int64(8192), ivs[1].End)
 }
 
 func TestJSONEmpty(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	data, err := json.Marshal(rs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "[]" {
-		t.Fatalf("JSON = %s, want []", data)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "[]", string(data))
 
 	rs2 := NewRangeSet()
-	if err := json.Unmarshal(data, rs2); err != nil {
-		t.Fatal(err)
-	}
-	if rs2.Len() != 0 {
-		t.Fatalf("expected 0 intervals, got %d", rs2.Len())
-	}
+	require.NoError(t, json.Unmarshal(data, rs2))
+	assert.Equal(t, 0, rs2.Len())
 }
 
 func TestSingleByte(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(42, 1)
-	if !rs.Contains(42, 1) {
-		t.Error("expected to contain single byte")
-	}
-	if rs.Contains(41, 1) {
-		t.Error("should not contain byte before")
-	}
-	if rs.Contains(43, 1) {
-		t.Error("should not contain byte after")
-	}
+	assert.True(t, rs.Contains(42, 1), "should contain single byte")
+	assert.False(t, rs.Contains(41, 1), "should not contain byte before")
+	assert.False(t, rs.Contains(43, 1), "should not contain byte after")
 }
 
 func TestString(t *testing.T) {
+	t.Parallel()
 	rs := NewRangeSet()
 	rs.Add(0, 10)
-	s := rs.String()
-	if s != "[[0,10]]" {
-		t.Fatalf("String() = %s, want [[0,10]]", s)
-	}
+	assert.Equal(t, "[[0,10]]", rs.String())
 }

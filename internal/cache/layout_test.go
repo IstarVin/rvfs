@@ -10,27 +10,32 @@ import (
 )
 
 func TestCacheDir(t *testing.T) {
+	t.Parallel()
 	got := CacheDir("/base", "remote1")
 	assert.Equal(t, filepath.Join("/base", "remote1"), got)
 }
 
 func TestCacheDirDifferentRemotes(t *testing.T) {
+	t.Parallel()
 	a := CacheDir("/base", "remote-a")
 	b := CacheDir("/base", "remote-b")
 	assert.NotEqual(t, a, b)
 }
 
 func TestFilePath(t *testing.T) {
+	t.Parallel()
 	got := FilePath("/base", "remote1", "docs/readme.md")
 	assert.Equal(t, filepath.Join("/base", "remote1", "files", "docs/readme.md"), got)
 }
 
 func TestFilePathRoot(t *testing.T) {
+	t.Parallel()
 	got := FilePath("/base", "remote1", "")
 	assert.Equal(t, filepath.Join("/base", "remote1", "files"), got)
 }
 
 func TestEnsureLayout(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	dbPath, err := EnsureLayout(base, "test-remote")
 	require.NoError(t, err)
@@ -44,6 +49,7 @@ func TestEnsureLayout(t *testing.T) {
 }
 
 func TestEnsureLayoutIdempotent(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 
 	dbPath1, err := EnsureLayout(base, "test-remote")
@@ -56,6 +62,7 @@ func TestEnsureLayoutIdempotent(t *testing.T) {
 }
 
 func TestEnsureLayoutCreatesNestedDirs(t *testing.T) {
+	t.Parallel()
 	base := filepath.Join(t.TempDir(), "deep", "path")
 	_, err := EnsureLayout(base, "remote")
 	require.NoError(t, err)
