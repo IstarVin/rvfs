@@ -49,4 +49,5 @@ func init() {
 	rootCmd.AddCommand(pinCmd)
 	rootCmd.AddCommand(unpinCmd)
 	rootCmd.AddCommand(pinsCmd)
+	rootCmd.AddCommand(initCmd)
 }
