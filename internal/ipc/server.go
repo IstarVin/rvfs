@@ -19,7 +19,7 @@ type Handler interface {
 	// HandleSync triggers a sync cycle, clearing retry timers first if force==true.
 	HandleSync(force bool) error
 	// HandlePrefetch starts (or resumes) downloading path into the cache.
-	HandlePrefetch(path string) error
+	HandlePrefetch(path string, sequential bool) error
 	// HandleEvict removes path from the on-disk cache and marks it evicted.
 	HandleEvict(path string) error
 	// HandleDownloads returns download/cache status for path, or all active
@@ -117,7 +117,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				_ = enc.Encode(SyncResponse{OK: true})
 			}
 		case "prefetch":
-			err := s.handler.HandlePrefetch(req.Path)
+			err := s.handler.HandlePrefetch(req.Path, req.Sequential)
 			if err != nil {
 				_ = enc.Encode(ActionResponse{OK: false, Err: err.Error()})
 			} else {

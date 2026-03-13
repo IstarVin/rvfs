@@ -24,7 +24,7 @@ var pinCmd = &cobra.Command{
 		}
 		defer cl.Close()
 
-		pinPaths, filePaths, err := pinTargets(cl, rel)
+		pinPaths, filePaths, targetIsDir, err := pinTargets(cl, rel)
 		if err != nil {
 			return err
 		}
@@ -39,7 +39,13 @@ var pinCmd = &cobra.Command{
 			started := 0
 			failed := make([]string, 0)
 			for _, p := range filePaths {
-				if err := c.Prefetch(p); err != nil {
+				var err error
+				if targetIsDir {
+					err = c.PrefetchSequential(p)
+				} else {
+					err = c.Prefetch(p)
+				}
+				if err != nil {
 					failed = append(failed, fmt.Sprintf("%s (%v)", p, err))
 					continue
 				}
@@ -49,9 +55,17 @@ var pinCmd = &cobra.Command{
 			case len(filePaths) == 0:
 				prefetchStatus = "no files to prefetch"
 			case len(failed) == 0:
-				prefetchStatus = fmt.Sprintf("prefetch started for %d file(s)", started)
+				if targetIsDir {
+					prefetchStatus = fmt.Sprintf("prefetch queued for %d file(s)", started)
+				} else {
+					prefetchStatus = fmt.Sprintf("prefetch started for %d file(s)", started)
+				}
 			default:
-				prefetchStatus = fmt.Sprintf("prefetch started for %d/%d file(s)", started, len(filePaths))
+				if targetIsDir {
+					prefetchStatus = fmt.Sprintf("prefetch queued for %d/%d file(s)", started, len(filePaths))
+				} else {
+					prefetchStatus = fmt.Sprintf("prefetch started for %d/%d file(s)", started, len(filePaths))
+				}
 				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but prefetch failed for %d file(s): %s\n", len(failed), strings.Join(failed, "; "))
 			}
 		} else {
@@ -76,7 +90,7 @@ var unpinCmd = &cobra.Command{
 		}
 		defer cl.Close()
 
-		pinPaths, filePaths, err := pinTargets(cl, rel)
+		pinPaths, filePaths, _, err := pinTargets(cl, rel)
 		if err != nil {
 			return err
 		}
@@ -128,25 +142,25 @@ func resolvePinTarget(args []string) (string, string, *cache.CacheLayer, string,
 	return remote, sockPath, cl, filepath.Clean(args[1]), nil
 }
 
-func pinTargets(cl *cache.CacheLayer, rel string) ([]string, []string, error) {
+func pinTargets(cl *cache.CacheLayer, rel string) ([]string, []string, bool, error) {
 	entry, err := cl.DB().GetFile(rel)
 	if err != nil {
-		return nil, nil, fmt.Errorf("lookup %q: %w", rel, err)
+		return nil, nil, false, fmt.Errorf("lookup %q: %w", rel, err)
 	}
 	if entry == nil {
-		return nil, nil, fmt.Errorf("path %q not found", rel)
+		return nil, nil, false, fmt.Errorf("path %q not found", rel)
 	}
 
 	paths := []string{rel}
 	filePaths := make([]string, 0)
 	if !entry.IsDir {
 		filePaths = append(filePaths, rel)
-		return paths, filePaths, nil
+		return paths, filePaths, false, nil
 	}
 
 	desc, err := cl.DB().ListDescendants(rel)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, true, err
 	}
 	for _, e := range desc {
 		paths = append(paths, e.Path)
@@ -155,7 +169,7 @@ func pinTargets(cl *cache.CacheLayer, rel string) ([]string, []string, error) {
 		}
 	}
 
-	return paths, filePaths, nil
+	return paths, filePaths, true, nil
 }
 
 var pinsCmd = &cobra.Command{
@@ -411,11 +425,16 @@ func listAllPins() error {
 		fmt.Println("No remotes found in cache directory.")
 		return nil
 	}
-	for _, dbPath := range entries {
+	sort.Strings(entries)
+	for i, dbPath := range entries {
 		remoteID := filepath.Base(filepath.Dir(dbPath))
 		source := remoteID + ":"
+		fmt.Printf("%s\n", source)
 		if err := listPins(source); err != nil {
 			fmt.Printf("  (error reading %s: %v)\n", remoteID, err)
+		}
+		if i < len(entries)-1 {
+			fmt.Println()
 		}
 	}
 	return nil

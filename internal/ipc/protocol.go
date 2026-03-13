@@ -14,6 +14,9 @@ type Request struct {
 	// Path is used with Cmd=="prefetch", "evict", or "downloads".
 	// For "downloads", an empty path means "list active downloads".
 	Path string `json:"path,omitempty"`
+	// Sequential is used with Cmd=="prefetch" to request queue-based,
+	// one-at-a-time processing for directory pin workflows.
+	Sequential bool `json:"sequential,omitempty"`
 }
 
 // StatusResponse is the server's reply to a "status" request.

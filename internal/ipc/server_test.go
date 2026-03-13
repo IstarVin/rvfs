@@ -22,6 +22,7 @@ type mockHandler struct {
 	syncErr       error
 	syncForceSeen bool
 	prefetchErr   error
+	prefetchSeq   bool
 	evictErr      error
 	downloadsResp DownloadStatusResponse
 	downloadsErr  error
@@ -41,10 +42,11 @@ func (m *mockHandler) HandleSync(force bool) error {
 	return m.syncErr
 }
 
-func (m *mockHandler) HandlePrefetch(path string) error {
+func (m *mockHandler) HandlePrefetch(path string, sequential bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastPath = path
+	m.prefetchSeq = sequential
 	return m.prefetchErr
 }
 
@@ -171,6 +173,23 @@ func TestServerPrefetchHappyPath(t *testing.T) {
 	require.NoError(t, c.Prefetch("docs/a.txt"))
 	h.mu.Lock()
 	assert.Equal(t, "docs/a.txt", h.lastPath)
+	assert.False(t, h.prefetchSeq)
+	h.mu.Unlock()
+}
+
+func TestServerPrefetchSequentialHappyPath(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	require.NoError(t, c.PrefetchSequential("docs/a.txt"))
+	h.mu.Lock()
+	assert.Equal(t, "docs/a.txt", h.lastPath)
+	assert.True(t, h.prefetchSeq)
 	h.mu.Unlock()
 }
 

@@ -80,21 +80,13 @@ func (c *Client) Sync(force bool) error {
 
 // Prefetch sends a "prefetch" request to start downloading path into cache.
 func (c *Client) Prefetch(path string) error {
-	if err := c.enc.Encode(Request{Cmd: "prefetch", Path: path}); err != nil {
-		return fmt.Errorf("ipc: send prefetch: %w", err)
-	}
-	raw, err := c.readRaw("prefetch")
-	if err != nil {
-		return err
-	}
-	var resp ActionResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("ipc: decode prefetch response: %w", err)
-	}
-	if !resp.OK {
-		return fmt.Errorf("prefetch failed: %s", resp.Err)
-	}
-	return nil
+	return c.prefetch(path, false)
+}
+
+// PrefetchSequential sends a "prefetch" request that should be queued and
+// processed one file at a time by the mount process.
+func (c *Client) PrefetchSequential(path string) error {
+	return c.prefetch(path, true)
 }
 
 // Evict sends an "evict" request to remove path from local cache now.
@@ -148,4 +140,22 @@ func (c *Client) readRaw(cmd string) ([]byte, error) {
 		return nil, fmt.Errorf("ipc: %s: %s", cmd, errEnv.Error)
 	}
 	return raw, nil
+}
+
+func (c *Client) prefetch(path string, sequential bool) error {
+	if err := c.enc.Encode(Request{Cmd: "prefetch", Path: path, Sequential: sequential}); err != nil {
+		return fmt.Errorf("ipc: send prefetch: %w", err)
+	}
+	raw, err := c.readRaw("prefetch")
+	if err != nil {
+		return err
+	}
+	var resp ActionResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return fmt.Errorf("ipc: decode prefetch response: %w", err)
+	}
+	if !resp.OK {
+		return fmt.Errorf("prefetch failed: %s", resp.Err)
+	}
+	return nil
 }

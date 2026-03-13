@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -299,7 +300,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	// Start IPC server so status/sync commands can communicate with us.
 	source := remoteName + ":" + remotePath
 	sockPath := ipc.MountSockPath(remoteName, absMountpoint)
-	srv := ipc.NewServer(sockPath, &mountHandler{
+	h := &mountHandler{
 		source:       source,
 		mountpoint:   absMountpoint,
 		cl:           cl,
@@ -309,7 +310,12 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		maxSize:      mountCacheSize,
 		minFreeSpace: mountCacheMinFreeSpace,
 		cacheDir:     cacheDir,
-	})
+		prefetchQ:    make(chan prefetchRequest, 1024),
+	}
+	h.startPrefetchWorker()
+	defer h.stopPrefetchWorker()
+
+	srv := ipc.NewServer(sockPath, h)
 	if listenErr := srv.Listen(); listenErr != nil {
 		slog.Warn("IPC server unavailable", "err", listenErr)
 	} else {
@@ -392,6 +398,15 @@ type mountHandler struct {
 	maxSize      int64
 	minFreeSpace int64
 	cacheDir     string
+
+	prefetchQ    chan prefetchRequest
+	prefetchWG   sync.WaitGroup
+	prefetchStop sync.Once
+}
+
+type prefetchRequest struct {
+	path string
+	size int64
 }
 
 // handleServiceInstall handles --install-service and --uninstall-service. It
@@ -471,7 +486,7 @@ func (h *mountHandler) HandleSync(force bool) error {
 	return nil
 }
 
-func (h *mountHandler) HandlePrefetch(path string) error {
+func (h *mountHandler) HandlePrefetch(path string, sequential bool) error {
 	if path == "" {
 		return fmt.Errorf("prefetch: missing path")
 	}
@@ -488,10 +503,45 @@ func (h *mountHandler) HandlePrefetch(path string) error {
 	if entry.IsDir {
 		return fmt.Errorf("prefetch: %q is a directory", path)
 	}
+	if sequential {
+		if h.prefetchQ == nil {
+			return fmt.Errorf("prefetch queue unavailable")
+		}
+		h.prefetchQ <- prefetchRequest{path: path, size: entry.Size}
+		return nil
+	}
 	if err := h.downloadMgr.Prefetch(path, entry.Size); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (h *mountHandler) startPrefetchWorker() {
+	if h.downloadMgr == nil || h.prefetchQ == nil {
+		return
+	}
+	h.prefetchWG.Add(1)
+	go func() {
+		defer h.prefetchWG.Done()
+		for req := range h.prefetchQ {
+			if err := h.downloadMgr.Prefetch(req.path, req.size); err != nil {
+				slog.Warn("prefetch queue: start failed", "path", req.path, "err", err)
+				continue
+			}
+			if err := h.downloadMgr.WaitForRange(req.path, 0, req.size); err != nil {
+				slog.Warn("prefetch queue: wait failed", "path", req.path, "err", err)
+			}
+		}
+	}()
+}
+
+func (h *mountHandler) stopPrefetchWorker() {
+	h.prefetchStop.Do(func() {
+		if h.prefetchQ != nil {
+			close(h.prefetchQ)
+		}
+		h.prefetchWG.Wait()
+	})
 }
 
 func (h *mountHandler) HandleEvict(path string) error {
