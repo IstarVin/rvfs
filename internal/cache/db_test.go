@@ -118,6 +118,30 @@ func TestListDir(t *testing.T) {
 	assert.Len(t, deep, 1, "sub/deep should have c.txt")
 }
 
+func TestListDescendants(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	entries := []*FileEntry{
+		{Path: "a.txt", State: StateClean, Mode: 0100644},
+		{Path: "sub", IsDir: true, State: StateClean, Mode: 040755},
+		{Path: "sub/b.txt", State: StateClean, Mode: 0100644},
+		{Path: "sub/deep", IsDir: true, State: StateClean, Mode: 040755},
+		{Path: "sub/deep/c.txt", State: StateClean, Mode: 0100644},
+		{Path: "sub2/x.txt", State: StateClean, Mode: 0100644},
+	}
+	for _, e := range entries {
+		require.NoError(t, db.PutFile(e))
+	}
+
+	got, err := db.ListDescendants("sub")
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, "sub/b.txt", got[0].Path)
+	assert.Equal(t, "sub/deep", got[1].Path)
+	assert.Equal(t, "sub/deep/c.txt", got[2].Path)
+}
+
 func TestListByState(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)
@@ -145,6 +169,52 @@ func TestDeleteFile(t *testing.T) {
 	got, err := db.GetFile("gone.txt")
 	require.NoError(t, err)
 	assert.Nil(t, got, "expected nil after delete")
+}
+
+func TestSetPinnedMany(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	for _, p := range []string{"d", "d/a.txt", "d/sub", "d/sub/b.txt"} {
+		isDir := p == "d" || p == "d/sub"
+		mode := uint32(0100644)
+		if isDir {
+			mode = 040755
+		}
+		require.NoError(t, db.PutFile(&FileEntry{Path: p, IsDir: isDir, Mode: mode, State: StateClean}))
+	}
+
+	require.NoError(t, db.SetPinnedMany([]string{"d", "d/a.txt", "d/sub", "d/sub/b.txt"}, true))
+
+	for _, p := range []string{"d", "d/a.txt", "d/sub", "d/sub/b.txt"} {
+		e, err := db.GetFile(p)
+		require.NoError(t, err)
+		require.NotNil(t, e)
+		assert.True(t, e.Pinned, "expected pinned for %s", p)
+	}
+
+	require.NoError(t, db.SetPinnedMany([]string{"d", "d/a.txt", "d/sub", "d/sub/b.txt"}, false))
+	for _, p := range []string{"d", "d/a.txt", "d/sub", "d/sub/b.txt"} {
+		e, err := db.GetFile(p)
+		require.NoError(t, err)
+		require.NotNil(t, e)
+		assert.False(t, e.Pinned, "expected unpinned for %s", p)
+	}
+}
+
+func TestSetPinnedManyRollbackOnMissingPath(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	require.NoError(t, db.PutFile(&FileEntry{Path: "a.txt", Mode: 0100644, State: StateClean}))
+
+	err := db.SetPinnedMany([]string{"a.txt", "missing.txt"}, true)
+	require.Error(t, err)
+
+	e, getErr := db.GetFile("a.txt")
+	require.NoError(t, getErr)
+	require.NotNil(t, e)
+	assert.False(t, e.Pinned, "update should be rolled back when one path is missing")
 }
 
 func TestPendingOpsOrdering(t *testing.T) {

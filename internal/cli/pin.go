@@ -3,101 +3,159 @@ package cli
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/ipc"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
 
+var pinsTree bool
+
 var pinCmd = &cobra.Command{
 	Use:   "pin (<source> <path> | <mount-path>)",
-	Short: "Pin a file so it is never evicted from the cache",
+	Short: "Pin a file or directory so it is never evicted from the cache",
 	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		var cl *cache.CacheLayer
-		var sockPath string
-		var rel string
-		var err error
-
-		if len(args) == 1 {
-			_, sockPath, cl, rel, err = resolveMountPath(args[0])
-			if err != nil {
-				return err
-			}
-		} else {
-			_, sockPath, cl, err = resolveSource(args[0])
-			if err != nil {
-				return err
-			}
-			rel = filepath.Clean(args[1])
+		_, sockPath, cl, rel, err := resolvePinTarget(args)
+		if err != nil {
+			return err
 		}
 		defer cl.Close()
 
-		if err := cl.DB().SetPinned(rel, true); err != nil {
+		pinPaths, filePaths, err := pinTargets(cl, rel)
+		if err != nil {
+			return err
+		}
+
+		if err := cl.DB().SetPinnedMany(pinPaths, true); err != nil {
 			return fmt.Errorf("pin %q: %w", rel, err)
 		}
 
 		prefetchStatus := "metadata-only"
 		if c, dialErr := ipc.Dial(sockPath); dialErr == nil {
 			defer c.Close()
-			if err := c.Prefetch(rel); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but prefetch failed for %s: %v\n", rel, err)
-			} else {
-				prefetchStatus = "prefetch started"
+			started := 0
+			failed := make([]string, 0)
+			for _, p := range filePaths {
+				if err := c.Prefetch(p); err != nil {
+					failed = append(failed, fmt.Sprintf("%s (%v)", p, err))
+					continue
+				}
+				started++
+			}
+			switch {
+			case len(filePaths) == 0:
+				prefetchStatus = "no files to prefetch"
+			case len(failed) == 0:
+				prefetchStatus = fmt.Sprintf("prefetch started for %d file(s)", started)
+			default:
+				prefetchStatus = fmt.Sprintf("prefetch started for %d/%d file(s)", started, len(filePaths))
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but prefetch failed for %d file(s): %s\n", len(failed), strings.Join(failed, "; "))
 			}
 		} else {
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but mount is not reachable; cache prefetch not started\n")
+			if len(filePaths) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but mount is not reachable; cache prefetch not started\n")
+			}
 		}
 
-		fmt.Printf("Pinned: %s (%s)\n", rel, prefetchStatus)
+		fmt.Printf("Pinned: %s (%d path(s), %s)\n", rel, len(pinPaths), prefetchStatus)
 		return nil
 	},
 }
 
 var unpinCmd = &cobra.Command{
 	Use:   "unpin (<source> <path> | <mount-path>)",
-	Short: "Unpin a file, allowing it to be evicted from the cache",
+	Short: "Unpin a file or directory, allowing it to be evicted from the cache",
 	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		var cl *cache.CacheLayer
-		var sockPath string
-		var rel string
-		var err error
-
-		if len(args) == 1 {
-			_, sockPath, cl, rel, err = resolveMountPath(args[0])
-			if err != nil {
-				return err
-			}
-		} else {
-			_, sockPath, cl, err = resolveSource(args[0])
-			if err != nil {
-				return err
-			}
-			rel = filepath.Clean(args[1])
+		_, sockPath, cl, rel, err := resolvePinTarget(args)
+		if err != nil {
+			return err
 		}
 		defer cl.Close()
 
-		if err := cl.DB().SetPinned(rel, false); err != nil {
+		pinPaths, filePaths, err := pinTargets(cl, rel)
+		if err != nil {
+			return err
+		}
+
+		if err := cl.DB().SetPinnedMany(pinPaths, false); err != nil {
 			return fmt.Errorf("unpin %q: %w", rel, err)
 		}
 
 		evictStatus := "metadata-only"
 		if c, dialErr := ipc.Dial(sockPath); dialErr == nil {
 			defer c.Close()
-			if err := c.Evict(rel); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but cache eviction failed for %s: %v\n", rel, err)
-			} else {
-				evictStatus = "cache evicted"
+			evicted := 0
+			failed := make([]string, 0)
+			for _, p := range filePaths {
+				if err := c.Evict(p); err != nil {
+					failed = append(failed, fmt.Sprintf("%s (%v)", p, err))
+					continue
+				}
+				evicted++
+			}
+			switch {
+			case len(filePaths) == 0:
+				evictStatus = "no files to evict"
+			case len(failed) == 0:
+				evictStatus = fmt.Sprintf("cache evicted for %d file(s)", evicted)
+			default:
+				evictStatus = fmt.Sprintf("cache evicted for %d/%d file(s)", evicted, len(filePaths))
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but cache eviction failed for %d file(s): %s\n", len(failed), strings.Join(failed, "; "))
 			}
 		} else {
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but mount is not reachable; immediate cache eviction skipped\n")
+			if len(filePaths) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but mount is not reachable; immediate cache eviction skipped\n")
+			}
 		}
 
-		fmt.Printf("Unpinned: %s (%s)\n", rel, evictStatus)
+		fmt.Printf("Unpinned: %s (%d path(s), %s)\n", rel, len(pinPaths), evictStatus)
 		return nil
 	},
+}
+
+func resolvePinTarget(args []string) (string, string, *cache.CacheLayer, string, error) {
+	if len(args) == 1 {
+		return resolveMountPath(args[0])
+	}
+	remote, sockPath, cl, err := resolveSource(args[0])
+	if err != nil {
+		return "", "", nil, "", err
+	}
+	return remote, sockPath, cl, filepath.Clean(args[1]), nil
+}
+
+func pinTargets(cl *cache.CacheLayer, rel string) ([]string, []string, error) {
+	entry, err := cl.DB().GetFile(rel)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lookup %q: %w", rel, err)
+	}
+	if entry == nil {
+		return nil, nil, fmt.Errorf("path %q not found", rel)
+	}
+
+	paths := []string{rel}
+	filePaths := make([]string, 0)
+	if !entry.IsDir {
+		filePaths = append(filePaths, rel)
+		return paths, filePaths, nil
+	}
+
+	desc, err := cl.DB().ListDescendants(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, e := range desc {
+		paths = append(paths, e.Path)
+		if !e.IsDir {
+			filePaths = append(filePaths, e.Path)
+		}
+	}
+
+	return paths, filePaths, nil
 }
 
 var pinsCmd = &cobra.Command{
@@ -106,7 +164,8 @@ var pinsCmd = &cobra.Command{
 	Long: `List all pinned paths for a remote.
 
   rvfs pins gdrive:Documents
-  rvfs pins /mnt/gdrive`,
+  rvfs pins /mnt/gdrive
+  rvfs pins gdrive:Documents --tree`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
@@ -138,7 +197,6 @@ func listPins(source string) error {
 }
 
 func printPins(cl *cache.CacheLayer) error {
-
 	pins, err := cl.DB().ListPinned()
 	if err != nil {
 		return fmt.Errorf("list pinned: %w", err)
@@ -148,16 +206,201 @@ func printPins(cl *cache.CacheLayer) error {
 		return nil
 	}
 
-	hdr := lipgloss.NewStyle().Bold(true).Underline(true)
-	fmt.Printf("%s  %s\n", hdr.Width(6).Render("TYPE"), hdr.Render("PATH"))
-	for _, e := range pins {
-		t := "file"
-		if e.IsDir {
-			t = "dir"
+	out, err := compactPinnedEntries(cl.DB(), pins)
+	if err != nil {
+		return err
+	}
+
+	if pinsTree {
+		for _, line := range renderPinsTree(out) {
+			fmt.Println(line)
 		}
-		fmt.Printf("%-8s %s\n", t, e.Path)
+		return nil
+	}
+
+	for _, e := range out {
+		fmt.Println(formatPinnedPath(e))
 	}
 	return nil
+}
+
+type pinnedOutput struct {
+	Path  string
+	IsDir bool
+}
+
+func compactPinnedEntries(db *cache.MetadataDB, pins []*cache.FileEntry) ([]pinnedOutput, error) {
+	display := make(map[string]pinnedOutput, len(pins))
+	for _, e := range pins {
+		display[e.Path] = pinnedOutput{Path: e.Path, IsDir: e.IsDir}
+	}
+
+	candidates, err := collapseCandidates(db, pins)
+	if err != nil {
+		return nil, err
+	}
+	collapsed := make(map[string]struct{})
+	for _, dir := range candidates {
+		if hasCollapsedAncestor(dir.Path, collapsed) {
+			continue
+		}
+		display[dir.Path] = dir
+		collapsed[dir.Path] = struct{}{}
+		prefix := dir.Path + "/"
+		for p := range display {
+			if strings.HasPrefix(p, prefix) {
+				delete(display, p)
+			}
+		}
+	}
+
+	out := make([]pinnedOutput, 0, len(display))
+	for _, e := range display {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+func hasCollapsedAncestor(path string, collapsed map[string]struct{}) bool {
+	dir := filepath.Dir(path)
+	for dir != "." && dir != "/" {
+		if _, ok := collapsed[dir]; ok {
+			return true
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			break
+		}
+		dir = next
+	}
+	return false
+}
+
+func collapseCandidates(db *cache.MetadataDB, pins []*cache.FileEntry) ([]pinnedOutput, error) {
+	seenDirs := make(map[string]struct{})
+	for _, e := range pins {
+		if e.IsDir {
+			seenDirs[e.Path] = struct{}{}
+		}
+		dir := filepath.Dir(e.Path)
+		for dir != "." && dir != "/" {
+			seenDirs[dir] = struct{}{}
+			next := filepath.Dir(dir)
+			if next == dir {
+				break
+			}
+			dir = next
+		}
+	}
+
+	dirs := make([]string, 0, len(seenDirs))
+	for d := range seenDirs {
+		dirs = append(dirs, d)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		if len(dirs[i]) == len(dirs[j]) {
+			return dirs[i] < dirs[j]
+		}
+		return len(dirs[i]) < len(dirs[j])
+	})
+
+	out := make([]pinnedOutput, 0)
+	for _, dir := range dirs {
+		entry, err := db.GetFile(dir)
+		if err != nil {
+			return nil, fmt.Errorf("compact pins: stat %q: %w", dir, err)
+		}
+		if entry == nil || !entry.IsDir {
+			continue
+		}
+
+		desc, err := db.ListDescendants(dir)
+		if err != nil {
+			return nil, fmt.Errorf("compact pins: descendants %q: %w", dir, err)
+		}
+		files := 0
+		allPinned := true
+		for _, d := range desc {
+			if d.IsDir {
+				continue
+			}
+			files++
+			if !d.Pinned {
+				allPinned = false
+				break
+			}
+		}
+		if files > 0 && allPinned {
+			out = append(out, pinnedOutput{Path: dir, IsDir: true})
+		}
+	}
+	return out, nil
+}
+
+func formatPinnedPath(e pinnedOutput) string {
+	if e.IsDir {
+		return e.Path + "/"
+	}
+	return e.Path
+}
+
+type treeNode struct {
+	name     string
+	isDir    bool
+	children map[string]*treeNode
+}
+
+func renderPinsTree(entries []pinnedOutput) []string {
+	root := &treeNode{children: make(map[string]*treeNode)}
+	for _, e := range entries {
+		parts := strings.Split(e.Path, "/")
+		n := root
+		for i, p := range parts {
+			child, ok := n.children[p]
+			if !ok {
+				child = &treeNode{name: p, children: make(map[string]*treeNode)}
+				n.children[p] = child
+			}
+			if i < len(parts)-1 {
+				child.isDir = true
+			}
+			n = child
+		}
+		n.isDir = e.IsDir || len(n.children) > 0
+	}
+
+	lines := make([]string, 0)
+	var walk func(prefix string, children map[string]*treeNode)
+	walk = func(prefix string, children map[string]*treeNode) {
+		names := make([]string, 0, len(children))
+		for n := range children {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+
+		for i, name := range names {
+			last := i == len(names)-1
+			branch := "├── "
+			nextPrefix := prefix + "│   "
+			if last {
+				branch = "└── "
+				nextPrefix = prefix + "    "
+			}
+
+			n := children[name]
+			label := n.name
+			if n.isDir || len(n.children) > 0 {
+				label += "/"
+			}
+			lines = append(lines, prefix+branch+label)
+			if len(n.children) > 0 {
+				walk(nextPrefix, n.children)
+			}
+		}
+	}
+	walk("", root.children)
+	return lines
 }
 
 func listAllPins() error {
@@ -176,4 +419,8 @@ func listAllPins() error {
 		}
 	}
 	return nil
+}
+
+func init() {
+	pinsCmd.Flags().BoolVar(&pinsTree, "tree", false, "Show pinned paths as a tree")
 }

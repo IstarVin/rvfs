@@ -276,6 +276,39 @@ func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
 	return result, rows.Err()
 }
 
+// ListDescendants returns all entries under dirPath recursively.
+// The returned entries do not include dirPath itself.
+func (m *MetadataDB) ListDescendants(dirPath string) ([]*FileEntry, error) {
+	prefix := dirPath + "/"
+
+	rows, err := m.db.Query(`
+		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
+		FROM files
+		WHERE path LIKE ?
+		ORDER BY path`,
+		prefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("list descendants %q: %w", dirPath, err)
+	}
+	defer rows.Close()
+
+	var result []*FileEntry
+	for rows.Next() {
+		e := &FileEntry{}
+		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
+			&e.RemoteMtime, &e.LocalMtime,
+			&e.CachePath, &e.State, &e.CachedRanges,
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
+			return nil, fmt.Errorf("scan descendant entry: %w", err)
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
 // ListByState returns all entries with the given state.
 func (m *MetadataDB) ListByState(state FileState) ([]*FileEntry, error) {
 	rows, err := m.db.Query(`
@@ -547,6 +580,49 @@ func (m *MetadataDB) SetPinned(path string, pinned bool) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("set pinned: path %q not found", path)
+	}
+	return nil
+}
+
+// SetPinnedMany sets or clears the pinned flag for multiple exact paths.
+// The update is transactional: either all paths are updated or none are.
+func (m *MetadataDB) SetPinnedMany(paths []string, pinned bool) error {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	v := 0
+	if pinned {
+		v = 1
+	}
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return fmt.Errorf("set pinned many: begin tx: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`UPDATE files SET pinned = ? WHERE path = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("set pinned many: prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, p := range paths {
+		res, err := stmt.Exec(v, p)
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("set pinned many %q: %w", p, err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			_ = tx.Rollback()
+			return fmt.Errorf("set pinned many: path %q not found", p)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("set pinned many: commit: %w", err)
 	}
 	return nil
 }
