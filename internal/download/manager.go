@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -412,6 +413,16 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 			dl.done = true
 			dl.cond.Broadcast()
 			go dl.finish()
+		} else if len(dl.goroutines) == 0 && dl.err != nil && !dl.done {
+			// All goroutines have exited due to error — remove from manager map
+			// so future Start() calls can retry the download.
+			dl.done = true
+			dl.cond.Broadcast()
+			go func() {
+				dl.mgr.mu.Lock()
+				delete(dl.mgr.downloads, dl.path)
+				dl.mgr.mu.Unlock()
+			}()
 		}
 		dl.mu.Unlock()
 	}()
@@ -423,15 +434,28 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 
 	pr, pw := io.Pipe()
 
+	// gCtx is cancelled when doneCh closes (manual cancel) or when the
+	// download goroutine exits naturally, so the adapter call cleans up.
+	gCtx, gCancel := context.WithCancel(context.Background())
 	go func() {
+		defer gCancel()
 		var err error
 		if isSequential && startOffset == 0 {
-			err = dl.mgr.adapter.Get(dl.path, pw)
+			err = dl.mgr.adapter.Get(gCtx, dl.path, pw)
 		} else {
 			length := dl.totalSize - startOffset
-			err = dl.mgr.adapter.GetRange(dl.path, startOffset, length, pw)
+			err = dl.mgr.adapter.GetRange(gCtx, dl.path, startOffset, length, pw)
 		}
 		pw.CloseWithError(err)
+	}()
+	// Cancel gCtx if the goroutine is stopped via doneCh before the
+	// download goroutine exits on its own.
+	go func() {
+		select {
+		case <-doneCh:
+			gCancel()
+		case <-gCtx.Done():
+		}
 	}()
 
 	buf := make([]byte, chunkSize)

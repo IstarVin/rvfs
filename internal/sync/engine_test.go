@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/remote"
 	"github.com/IstarVin/rvfs/internal/testutil"
 )
@@ -250,7 +251,7 @@ func TestPullNewFiles(t *testing.T) {
 func TestPullNewDirectory(t *testing.T) {
 	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{
-		ListFunc: func(path string) ([]remote.FileInfo, error) {
+		ListFunc: func(_ context.Context, path string) ([]remote.FileInfo, error) {
 			if path == "" {
 				return []remote.FileInfo{
 					{Path: "subdir", Name: "subdir", IsDir: true, Mtime: time.Unix(100, 0)},
@@ -370,7 +371,7 @@ func TestPullDoesNotDeleteDirtyFiles(t *testing.T) {
 func TestPullRecursiveSubdirs(t *testing.T) {
 	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{
-		ListFunc: func(path string) ([]remote.FileInfo, error) {
+		ListFunc: func(_ context.Context, path string) ([]remote.FileInfo, error) {
 			switch path {
 			case "":
 				return []remote.FileInfo{
@@ -504,7 +505,7 @@ func TestUploadDirtyConflict_ResolverInvoked(t *testing.T) {
 	var resolveInvoked bool
 	adapter := &testutil.MockRemoteAdapter{
 		ListItems: []remote.FileInfo{},
-		StatFunc: func(path string) (remote.FileInfo, error) {
+		StatFunc: func(_ context.Context, path string) (remote.FileInfo, error) {
 			return remote.FileInfo{
 				Path: path, Mtime: remoteMtime, Size: 10,
 			}, nil
@@ -593,4 +594,107 @@ func TestPullSameRemoteMtime_NoChange(t *testing.T) {
 	got, err := cl.DB().GetFile("same.txt")
 	require.NoError(t, err)
 	assert.Equal(t, cache.StateClean, got.State, "same mtime should not re-evict")
+}
+
+// ---------- Phase-4 tests ----------
+
+// TestUploadCancelledOnOffline verifies that an in-progress upload is
+// cancelled when the connectivity monitor transitions to OFFLINE.
+func TestUploadCancelledOnOffline(t *testing.T) {
+	t.Parallel()
+
+	probeErr := errors.New("no route to host")
+	probeAdapter := &testutil.MockRemoteAdapter{
+		ProbeErrs: []error{probeErr, probeErr, probeErr},
+		ListItems: []remote.FileInfo{},
+	}
+	mon := connectivity.New(probeAdapter, 10*time.Millisecond, 3)
+
+	uploadStarted := make(chan struct{}, 1)
+	uploadAdapter := &testutil.MockRemoteAdapter{
+		ListItems: []remote.FileInfo{},
+		PutFunc: func(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error {
+			select {
+			case uploadStarted <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	cl := newTestCacheLayer(t)
+	e := NewEngine(uploadAdapter, cl, 50*time.Millisecond, mon, StrategyBoth)
+
+	f, _, err := cl.Create("offline.txt", 0644)
+	require.NoError(t, err)
+	_, _ = f.Write([]byte("data"))
+	f.Close()
+
+	mon.Start()
+	defer mon.Stop()
+
+	sub := mon.Subscribe()
+	go e.uploadDirty()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not start in time")
+	}
+
+	// Wait for OFFLINE (which cancels the upload context).
+	for {
+		select {
+		case s := <-sub:
+			if s == connectivity.StateOffline {
+				goto offline
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("monitor did not go offline in time")
+		}
+	}
+offline:
+	require.Eventually(t, func() bool {
+		ent, _ := cl.DB().GetFile("offline.txt")
+		return ent != nil && ent.State == cache.StateDirty
+	}, 500*time.Millisecond, 10*time.Millisecond,
+		"file should revert to dirty after cancelled upload")
+}
+
+// TestPullSubdirErrorContinues verifies that a List failure in one subdirectory
+// does not abort the pull — sibling entries at the root are still synced.
+func TestPullSubdirErrorContinues(t *testing.T) {
+	t.Parallel()
+
+	listErr := errors.New("i/o timeout")
+	adapter := &testutil.MockRemoteAdapter{
+		ListFunc: func(_ context.Context, path string) ([]remote.FileInfo, error) {
+			switch path {
+			case "":
+				return []remote.FileInfo{
+					{Path: "broken", Name: "broken", IsDir: true, Mtime: time.Unix(1, 0)},
+					{Path: "root.txt", Name: "root.txt", Size: 7, Mtime: time.Unix(1, 0)},
+				}, nil
+			case "broken":
+				return nil, listErr
+			}
+			return nil, nil
+		},
+	}
+	e, cl := newTestEngine(t, adapter, StrategyBoth)
+
+	require.NoError(t, e.PullOnce())
+
+	// The broken dir entry should still appear (added during the root pass
+	// before the recursive call fails).
+	dir, err := cl.DB().GetFile("broken")
+	require.NoError(t, err)
+	assert.NotNil(t, dir, "broken dir entry should exist after partial pull")
+
+	// root.txt must have been synced despite the subdir error.
+	file, err := cl.DB().GetFile("root.txt")
+	require.NoError(t, err)
+	require.NotNil(t, file, "root.txt should be synced even when a sibling subdir failed")
+	assert.Equal(t, int64(7), file.Size)
 }

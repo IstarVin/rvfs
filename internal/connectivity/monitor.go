@@ -166,7 +166,9 @@ func (m *Monitor) nextDelay() time.Duration {
 }
 
 func (m *Monitor) probe() {
-	err := m.adapter.Probe()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), m.interval)
+	defer probeCancel()
+	err := m.adapter.Probe(probeCtx)
 
 	m.mu.Lock()
 	if err != nil {

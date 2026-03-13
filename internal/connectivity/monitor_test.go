@@ -23,7 +23,7 @@ type mockAdapter struct {
 	idx    int
 }
 
-func (a *mockAdapter) Probe() error {
+func (a *mockAdapter) Probe(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.idx >= len(a.probes) {
@@ -35,17 +35,23 @@ func (a *mockAdapter) Probe() error {
 }
 
 // Remaining RemoteAdapter methods - not used by Monitor.
-func (a *mockAdapter) List(_ string) ([]remote.FileInfo, error)              { return nil, nil }
-func (a *mockAdapter) Stat(_ string) (remote.FileInfo, error)                { return remote.FileInfo{}, nil }
-func (a *mockAdapter) Get(_ string, _ io.Writer) error                       { return nil }
-func (a *mockAdapter) GetRange(_ string, _, _ int64, _ io.Writer) error      { return nil }
+func (a *mockAdapter) List(_ context.Context, _ string) ([]remote.FileInfo, error) {
+	return nil, nil
+}
+func (a *mockAdapter) Stat(_ context.Context, _ string) (remote.FileInfo, error) {
+	return remote.FileInfo{}, nil
+}
+func (a *mockAdapter) Get(_ context.Context, _ string, _ io.Writer) error { return nil }
+func (a *mockAdapter) GetRange(_ context.Context, _ string, _, _ int64, _ io.Writer) error {
+	return nil
+}
 func (a *mockAdapter) Put(_ context.Context, _ string, _ io.Reader, _ int64, _ time.Time) error {
 	return nil
 }
-func (a *mockAdapter) Delete(_ string) error                                 { return nil }
-func (a *mockAdapter) Mkdir(_ string) error                                  { return nil }
-func (a *mockAdapter) Rename(_, _ string) error                              { return nil }
-func (a *mockAdapter) SupportsRange() bool                                   { return false }
+func (a *mockAdapter) Delete(_ context.Context, _ string) error   { return nil }
+func (a *mockAdapter) Mkdir(_ context.Context, _ string) error    { return nil }
+func (a *mockAdapter) Rename(_ context.Context, _, _ string) error { return nil }
+func (a *mockAdapter) SupportsRange() bool                         { return false }
 
 var errProbe = errors.New("probe: connection refused")
 

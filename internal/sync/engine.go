@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -146,6 +147,17 @@ func (e *Engine) CancelUpload(path string) {
 	}
 }
 
+// monitorCtx returns the connectivity monitor's context when a monitor is
+// configured, or context.Background() otherwise. Using this as the parent
+// for upload contexts means uploads are automatically cancelled when the
+// monitor transitions to OFFLINE.
+func (e *Engine) monitorCtx() context.Context {
+	if e.monitor != nil {
+		return e.monitor.Context()
+	}
+	return context.Background()
+}
+
 // ---------- Upload ----------
 
 func (e *Engine) uploadDirty() {
@@ -169,9 +181,13 @@ func (e *Engine) uploadFile(entry *cache.FileEntry) {
 	// remote mtime (i.e. were previously synced); brand-new local files
 	// (RemoteMtime==0) are always safe to upload.
 	if e.resolver != nil && entry.RemoteMtime > 0 {
-		remoteStat, statErr := e.adapter.Stat(entry.Path)
+		statCtx, statCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		remoteStat, statErr := e.adapter.Stat(statCtx, entry.Path)
+		statCancel()
 		if statErr == nil && remoteStat.Mtime.Unix() > entry.RemoteMtime {
-			_ = e.resolver.Resolve(entry, remoteStat)
+			if err := e.resolver.Resolve(entry, remoteStat); err != nil {
+				slog.Warn("sync: conflict resolve failed", "path", entry.Path, "err", err)
+			}
 			return
 		}
 	}
@@ -183,13 +199,16 @@ func (e *Engine) uploadFile(entry *cache.FileEntry) {
 
 	f, err := e.cache.Open(entry.Path, os.O_RDONLY)
 	if err != nil {
-		_ = e.cache.DB().SetState(entry.Path, cache.StateDirty)
+		if dbErr := e.cache.DB().SetState(entry.Path, cache.StateDirty); dbErr != nil {
+			slog.Warn("sync: revert to dirty failed", "path", entry.Path, "err", dbErr)
+		}
 		return
 	}
 	defer f.Close()
 
 	// Register a cancellable context so Unlink can abort this upload.
-	ctx, cancel := context.WithCancel(context.Background())
+	// Use monitorCtx() as parent so uploads auto-cancel on OFFLINE.
+	ctx, cancel := context.WithCancel(e.monitorCtx())
 	e.uploadMu.Lock()
 	e.uploadCtxs[entry.Path] = cancel
 	e.uploadMu.Unlock()
@@ -203,11 +222,15 @@ func (e *Engine) uploadFile(entry *cache.FileEntry) {
 	mtime := time.Unix(entry.LocalMtime, 0)
 	if err := e.adapter.Put(ctx, entry.Path, f, entry.Size, mtime); err != nil {
 		// Revert to dirty on failure.
-		_ = e.cache.DB().SetState(entry.Path, cache.StateDirty)
+		if dbErr := e.cache.DB().SetState(entry.Path, cache.StateDirty); dbErr != nil {
+			slog.Warn("sync: revert to dirty failed", "path", entry.Path, "err", dbErr)
+		}
 		// Record sync error.
 		entry.SyncError = err.Error()
 		entry.State = cache.StateDirty
-		_ = e.cache.DB().PutFile(entry)
+		if dbErr := e.cache.DB().PutFile(entry); dbErr != nil {
+			slog.Warn("sync: record sync error failed", "path", entry.Path, "err", dbErr)
+		}
 		return
 	}
 
@@ -215,7 +238,9 @@ func (e *Engine) uploadFile(entry *cache.FileEntry) {
 	entry.State = cache.StateClean
 	entry.RemoteMtime = entry.LocalMtime
 	entry.SyncError = ""
-	_ = e.cache.DB().PutFile(entry)
+	if err := e.cache.DB().PutFile(entry); err != nil {
+		slog.Warn("sync: mark clean failed", "path", entry.Path, "err", err)
+	}
 }
 
 // ---------- Pending Ops ----------
@@ -227,31 +252,34 @@ func (e *Engine) processPendingOps() {
 	}
 
 	for _, op := range ops {
+		opCtx, opCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var opErr error
 		switch op.Op {
 		case "delete":
-			opErr = e.adapter.Delete(op.Path)
+			opErr = e.adapter.Delete(opCtx, op.Path)
 		case "mkdir":
-			opErr = e.adapter.Mkdir(op.Path)
+			opErr = e.adapter.Mkdir(opCtx, op.Path)
 		case "rmdir":
-			opErr = e.adapter.Delete(op.Path) // Drive doesn't distinguish
+			opErr = e.adapter.Delete(opCtx, op.Path) // Drive doesn't distinguish
 		case "rename":
-			opErr = e.adapter.Rename(op.Path, op.DestPath)
+			opErr = e.adapter.Rename(opCtx, op.Path, op.DestPath)
 		case "put":
 			// Handled by uploadDirty; skip here to avoid double upload.
 			opErr = nil
 		}
+		opCancel()
 
 		if opErr != nil {
 			// Increment attempt count; leave for retry.
 			op.Attempts++
 			op.LastError = opErr.Error()
-			// For now just log and continue.
-			fmt.Fprintf(os.Stderr, "sync: op %s %s failed: %v\n", op.Op, op.Path, opErr)
+			slog.Warn("sync: pending op failed", "op", op.Op, "path", op.Path, "err", opErr)
 			continue
 		}
 
-		_ = e.cache.DB().CompletePendingOp(op.ID)
+		if err := e.cache.DB().CompletePendingOp(op.ID); err != nil {
+			slog.Warn("sync: complete pending op failed", "id", op.ID, "err", err)
+		}
 	}
 }
 
@@ -262,7 +290,9 @@ func (e *Engine) pull() error {
 }
 
 func (e *Engine) pullDir(dirPath string) error {
-	remoteFiles, err := e.adapter.List(dirPath)
+	listCtx, listCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	remoteFiles, err := e.adapter.List(listCtx, dirPath)
+	listCancel()
 	if err != nil {
 		return fmt.Errorf("pull list %q: %w", dirPath, err)
 	}
@@ -288,7 +318,7 @@ func (e *Engine) pullDir(dirPath string) error {
 			} else {
 				mode = 0100644 // S_IFREG | 0644
 			}
-			_ = e.cache.DB().PutFile(&cache.FileEntry{
+			if err := e.cache.DB().PutFile(&cache.FileEntry{
 				Path:        rf.Path,
 				IsDir:       rf.IsDir,
 				Size:        rf.Size,
@@ -298,7 +328,9 @@ func (e *Engine) pullDir(dirPath string) error {
 				CachePath:   e.cache.DiskPath(rf.Path),
 				State:       cache.StateEvicted,
 				Checksum:    rf.Checksum,
-			})
+			}); err != nil {
+				slog.Warn("sync: insert new remote file failed", "path", rf.Path, "err", err)
+			}
 			continue
 		}
 
@@ -311,7 +343,9 @@ func (e *Engine) pullDir(dirPath string) error {
 				existing.Size = rf.Size
 				existing.RemoteMtime = remoteMtime
 				existing.Checksum = rf.Checksum
-				_ = e.cache.DB().PutFile(existing)
+				if err := e.cache.DB().PutFile(existing); err != nil {
+					slog.Warn("sync: re-evict on remote update failed", "path", rf.Path, "err", err)
+				}
 				// Remove stale cache file if it exists.
 				os.Remove(e.cache.DiskPath(rf.Path))
 
@@ -320,11 +354,15 @@ func (e *Engine) pullDir(dirPath string) error {
 				// Delegate to the resolver (strategy = both/local-wins/…).
 				if e.resolver != nil {
 					existing.RemoteMtime = remoteMtime
-					_ = e.resolver.Resolve(existing, rf)
+					if err := e.resolver.Resolve(existing, rf); err != nil {
+						slog.Warn("sync: conflict resolve failed", "path", rf.Path, "err", err)
+					}
 				} else {
 					existing.State = cache.StateConflict
 					existing.RemoteMtime = remoteMtime
-					_ = e.cache.DB().PutFile(existing)
+					if err := e.cache.DB().PutFile(existing); err != nil {
+						slog.Warn("sync: mark conflict failed", "path", rf.Path, "err", err)
+					}
 				}
 			}
 		}
@@ -338,7 +376,9 @@ func (e *Engine) pullDir(dirPath string) error {
 	for _, le := range localEntries {
 		if _, found := remotePaths[le.Path]; !found {
 			if le.State == cache.StateClean || le.State == cache.StateEvicted {
-				_ = e.cache.DB().DeleteFile(le.Path)
+				if err := e.cache.DB().DeleteFile(le.Path); err != nil {
+					slog.Warn("sync: delete stale local entry failed", "path", le.Path, "err", err)
+				}
 				os.Remove(e.cache.DiskPath(le.Path))
 			}
 		}
@@ -349,7 +389,7 @@ func (e *Engine) pullDir(dirPath string) error {
 		if rf.IsDir {
 			if err := e.pullDir(rf.Path); err != nil {
 				// Log error but continue syncing other subdirectories.
-				_ = fmt.Errorf("pull subdir %q: %w", rf.Path, err)
+				slog.Warn("sync: pull subdir failed", "path", rf.Path, "err", err)
 			}
 		}
 	}

@@ -250,7 +250,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 
 	// Probe connectivity. If the probe fails but a local cache DB already
 	// exists, allow mounting offline so cached files remain accessible.
-	if probeErr := adapter.Probe(); probeErr != nil {
+	if probeErr := adapter.Probe(context.Background()); probeErr != nil {
 		dbPath := filepath.Join(cacheDir, remoteID, "meta.db")
 		if _, statErr := os.Stat(dbPath); statErr != nil {
 			// No local cache — nothing useful to serve offline.

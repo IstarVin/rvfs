@@ -100,10 +100,7 @@ func (rs *RangeSet) Gaps(totalSize int64) []Interval {
 			break
 		}
 		if iv.Start > pos {
-			end := iv.Start
-			if end > totalSize {
-				end = totalSize
-			}
+			end := min(iv.Start, totalSize)
 			gaps = append(gaps, Interval{Start: pos, End: end})
 		}
 		if iv.End > pos {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"strings"
@@ -68,7 +69,7 @@ func New(clientID, clientSecret, tokenPath, rootPath string, db *cache.MetadataD
 	}
 
 	// Resolve the root folder ID.
-	rootID, err := adapter.resolveRootID()
+	rootID, err := adapter.resolveRootID(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("resolve root %q: %w", rootPath, err)
 	}
@@ -114,7 +115,7 @@ func Authenticate(clientID, clientSecret, tokenPath string) error {
 	})
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", PORT),
+		Addr:    fmt.Sprintf("127.0.0.1:%d", PORT),
 		Handler: mux,
 	}
 
@@ -155,8 +156,8 @@ func Authenticate(clientID, clientSecret, tokenPath string) error {
 
 // ---------- RemoteAdapter implementation ----------
 
-func (g *GDriveAdapter) List(dirPath string) ([]remote.FileInfo, error) {
-	parentID, err := g.resolveID(dirPath)
+func (g *GDriveAdapter) List(ctx context.Context, dirPath string) ([]remote.FileInfo, error) {
+	parentID, err := g.resolveID(ctx, dirPath)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +176,7 @@ func (g *GDriveAdapter) List(dirPath string) ([]remote.FileInfo, error) {
 			call = call.PageToken(pageToken)
 		}
 
-		fl, err := call.Do()
+		fl, err := call.Context(ctx).Do()
 		if err != nil {
 			return nil, fmt.Errorf("list %q: %w", dirPath, err)
 		}
@@ -221,14 +222,15 @@ func (g *GDriveAdapter) List(dirPath string) ([]remote.FileInfo, error) {
 	return result, nil
 }
 
-func (g *GDriveAdapter) Stat(filePath string) (remote.FileInfo, error) {
-	id, err := g.resolveID(filePath)
+func (g *GDriveAdapter) Stat(ctx context.Context, filePath string) (remote.FileInfo, error) {
+	id, err := g.resolveID(ctx, filePath)
 	if err != nil {
 		return remote.FileInfo{}, err
 	}
 
 	f, err := g.srv.Files.Get(id).
 		Fields("id, name, size, mimeType, modifiedTime, md5Checksum").
+		Context(ctx).
 		Do()
 	if err != nil {
 		return remote.FileInfo{}, fmt.Errorf("stat %q: %w", filePath, err)
@@ -249,13 +251,13 @@ func (g *GDriveAdapter) Stat(filePath string) (remote.FileInfo, error) {
 	}, nil
 }
 
-func (g *GDriveAdapter) Get(filePath string, dest io.Writer) error {
-	id, err := g.resolveID(filePath)
+func (g *GDriveAdapter) Get(ctx context.Context, filePath string, dest io.Writer) error {
+	id, err := g.resolveID(ctx, filePath)
 	if err != nil {
 		return err
 	}
 
-	resp, err := g.srv.Files.Get(id).Download()
+	resp, err := g.srv.Files.Get(id).Context(ctx).Download()
 	if err != nil {
 		return fmt.Errorf("download %q: %w", filePath, err)
 	}
@@ -265,23 +267,21 @@ func (g *GDriveAdapter) Get(filePath string, dest io.Writer) error {
 	return err
 }
 
-func (g *GDriveAdapter) GetRange(filePath string, offset, length int64, dest io.Writer) error {
-	id, err := g.resolveID(filePath)
+func (g *GDriveAdapter) GetRange(ctx context.Context, filePath string, offset, length int64, dest io.Writer) error {
+	id, err := g.resolveID(ctx, filePath)
 	if err != nil {
 		return err
 	}
 
 	// Build a range request manually via the HTTP client.
 	url := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s?alt=media", id)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
 	endByte := offset + length - 1
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, endByte))
 
-	client := g.srv.BasePath // unused; we need the http.Client from the service
-	_ = client
 	// Use the oauth2 http client embedded in the service.
 	resp, err := g.httpClient().Do(req)
 	if err != nil {
@@ -301,13 +301,13 @@ func (g *GDriveAdapter) Put(ctx context.Context, filePath string, src io.Reader,
 	dirPath, name := path.Split(filePath)
 	dirPath = strings.TrimSuffix(dirPath, "/")
 
-	parentID, err := g.resolveID(dirPath)
+	parentID, err := g.resolveID(ctx, dirPath)
 	if err != nil {
 		return err
 	}
 
 	// Check if file already exists (update vs create).
-	existingID, _ := g.resolveID(filePath)
+	existingID, _ := g.resolveID(ctx, filePath)
 
 	meta := &drive.File{
 		Name:         name,
@@ -334,13 +334,13 @@ func (g *GDriveAdapter) Put(ctx context.Context, filePath string, src io.Reader,
 	return nil
 }
 
-func (g *GDriveAdapter) Delete(filePath string) error {
-	id, err := g.resolveID(filePath)
+func (g *GDriveAdapter) Delete(ctx context.Context, filePath string) error {
+	id, err := g.resolveID(ctx, filePath)
 	if err != nil {
 		return err
 	}
 
-	if err := g.srv.Files.Delete(id).Do(); err != nil {
+	if err := g.srv.Files.Delete(id).Context(ctx).Do(); err != nil {
 		return fmt.Errorf("delete %q: %w", filePath, err)
 	}
 
@@ -348,11 +348,11 @@ func (g *GDriveAdapter) Delete(filePath string) error {
 	return nil
 }
 
-func (g *GDriveAdapter) Mkdir(dirPath string) error {
+func (g *GDriveAdapter) Mkdir(ctx context.Context, dirPath string) error {
 	parentPath, name := path.Split(dirPath)
 	parentPath = strings.TrimSuffix(parentPath, "/")
 
-	parentID, err := g.resolveID(parentPath)
+	parentID, err := g.resolveID(ctx, parentPath)
 	if err != nil {
 		return err
 	}
@@ -363,7 +363,7 @@ func (g *GDriveAdapter) Mkdir(dirPath string) error {
 		Parents:  []string{parentID},
 	}
 
-	f, err := g.srv.Files.Create(meta).Fields("id").Do()
+	f, err := g.srv.Files.Create(meta).Fields("id").Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("mkdir %q: %w", dirPath, err)
 	}
@@ -376,21 +376,21 @@ func (g *GDriveAdapter) Mkdir(dirPath string) error {
 	return nil
 }
 
-func (g *GDriveAdapter) Rename(src, dst string) error {
-	id, err := g.resolveID(src)
+func (g *GDriveAdapter) Rename(ctx context.Context, src, dst string) error {
+	id, err := g.resolveID(ctx, src)
 	if err != nil {
 		return err
 	}
 
 	// Get current parents.
-	f, err := g.srv.Files.Get(id).Fields("parents").Do()
+	f, err := g.srv.Files.Get(id).Fields("parents").Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("rename get parents %q: %w", src, err)
 	}
 
 	newParentPath, newName := path.Split(dst)
 	newParentPath = strings.TrimSuffix(newParentPath, "/")
-	newParentID, err := g.resolveID(newParentPath)
+	newParentID, err := g.resolveID(ctx, newParentPath)
 	if err != nil {
 		return err
 	}
@@ -399,6 +399,7 @@ func (g *GDriveAdapter) Rename(src, dst string) error {
 	_, err = g.srv.Files.Update(id, &drive.File{Name: newName}).
 		AddParents(newParentID).
 		RemoveParents(oldParents).
+		Context(ctx).
 		Do()
 	if err != nil {
 		return fmt.Errorf("rename %q→%q: %w", src, dst, err)
@@ -413,8 +414,8 @@ func (g *GDriveAdapter) Rename(src, dst string) error {
 	return nil
 }
 
-func (g *GDriveAdapter) Probe() error {
-	_, err := g.srv.About.Get().Fields("user").Do()
+func (g *GDriveAdapter) Probe(ctx context.Context) error {
+	_, err := g.srv.About.Get().Fields("user").Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("probe: %w", err)
 	}
@@ -429,7 +430,7 @@ func (g *GDriveAdapter) SupportsRange() bool {
 
 // resolveRootID resolves the configured rootPath to a Drive folder ID.
 // An empty rootPath maps to "root" (the user's My Drive).
-func (g *GDriveAdapter) resolveRootID() (string, error) {
+func (g *GDriveAdapter) resolveRootID(ctx context.Context) (string, error) {
 	if g.rootPath == "" {
 		return "root", nil
 	}
@@ -458,7 +459,7 @@ func (g *GDriveAdapter) resolveRootID() (string, error) {
 		// Walk via API.
 		query := fmt.Sprintf("'%s' in parents and name = '%s' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
 			escapeQuery(parentID), escapeQuery(part))
-		fl, err := g.srv.Files.List().Q(query).Fields("files(id)").PageSize(1).Do()
+		fl, err := g.srv.Files.List().Q(query).Fields("files(id)").PageSize(1).Context(ctx).Do()
 		if err != nil {
 			return "", fmt.Errorf("resolve root segment %q: %w", part, err)
 		}
@@ -479,7 +480,7 @@ func (g *GDriveAdapter) resolveRootID() (string, error) {
 
 // resolveID resolves a relative path (relative to rootPath) to a Drive file ID.
 // Empty path resolves to rootID.
-func (g *GDriveAdapter) resolveID(relPath string) (string, error) {
+func (g *GDriveAdapter) resolveID(ctx context.Context, relPath string) (string, error) {
 	if relPath == "" {
 		return g.rootID, nil
 	}
@@ -522,7 +523,7 @@ func (g *GDriveAdapter) resolveID(relPath string) (string, error) {
 			query += " and mimeType = 'application/vnd.google-apps.folder'"
 		}
 
-		fl, err := g.srv.Files.List().Q(query).Fields("files(id)").PageSize(1).Do()
+		fl, err := g.srv.Files.List().Q(query).Fields("files(id)").PageSize(1).Context(ctx).Do()
 		if err != nil {
 			return "", fmt.Errorf("resolve %q segment %q: %w", relPath, part, err)
 		}
@@ -543,9 +544,11 @@ func (g *GDriveAdapter) resolveID(relPath string) (string, error) {
 
 // httpClient returns the OAuth2-authenticated HTTP client from the Drive service.
 func (g *GDriveAdapter) httpClient() *http.Client {
-	ctx := context.Background()
-	tok, _ := loadToken(g.tokenPath)
-	return g.oauthCfg.Client(ctx, tok)
+	tok, err := loadToken(g.tokenPath)
+	if err != nil {
+		slog.Warn("gdrive: failed to reload token for range request", "err", err)
+	}
+	return g.oauthCfg.Client(context.Background(), tok)
 }
 
 // escapeQuery escapes a string for use in Drive API query parameters.

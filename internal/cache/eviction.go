@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -139,7 +140,9 @@ func evictEntry(cl *CacheLayer, e *FileEntry) {
 	if err := os.Remove(dp); err != nil && !os.IsNotExist(err) {
 		return
 	}
-	_ = cl.db.SetState(e.Path, StateEvicted)
+	if err := cl.db.SetState(e.Path, StateEvicted); err != nil {
+		slog.Warn("evict: set state failed", "path", e.Path, "err", err)
+	}
 }
 
 // dirSize returns the total byte size of all regular files under dir.

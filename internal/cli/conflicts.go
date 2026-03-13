@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -160,7 +161,7 @@ var resolveCmd = &cobra.Command{
 
 		// For remote/both strategies we need a live adapter.
 		var adapter interface {
-			Get(path string, dest io.Writer) error
+			Get(ctx context.Context, path string, dest io.Writer) error
 		}
 		if resolveKeep == "remote" || resolveKeep == "both" {
 			adapter, err = buildAdapter(remoteName, cacheDir, cl)
@@ -182,7 +183,7 @@ var resolveCmd = &cobra.Command{
 
 // applyResolution applies the chosen strategy to a single conflict entry.
 func applyResolution(cl *cache.CacheLayer, adapter interface {
-	Get(path string, dest io.Writer) error
+	Get(ctx context.Context, path string, dest io.Writer) error
 }, ce *cache.ConflictEntry, keep string) error {
 	switch keep {
 	case "local":
@@ -205,7 +206,7 @@ func applyResolution(cl *cache.CacheLayer, adapter interface {
 		if err != nil {
 			return fmt.Errorf("create: %w", err)
 		}
-		if dlErr := adapter.Get(ce.Path, f); dlErr != nil {
+		if dlErr := adapter.Get(context.Background(), ce.Path, f); dlErr != nil {
 			f.Close()
 			os.Remove(diskPath)
 			return fmt.Errorf("download: %w", dlErr)
@@ -231,7 +232,7 @@ func applyResolution(cl *cache.CacheLayer, adapter interface {
 			if err != nil {
 				return fmt.Errorf("create sidecar: %w", err)
 			}
-			if dlErr := adapter.Get(ce.Path, f); dlErr != nil {
+			if dlErr := adapter.Get(context.Background(), ce.Path, f); dlErr != nil {
 				f.Close()
 				os.Remove(diskConflictPath)
 				return fmt.Errorf("download sidecar: %w", dlErr)

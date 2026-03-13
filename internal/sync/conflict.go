@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -92,7 +93,7 @@ func (r *Resolver) applyRemoteWins(entry *cache.FileEntry, remoteStat remote.Fil
 		return fmt.Errorf("conflict remote-wins create: %w", err)
 	}
 
-	if dlErr := r.adapter.Get(entry.Path, f); dlErr != nil {
+	if dlErr := r.adapter.Get(context.Background(), entry.Path, f); dlErr != nil {
 		f.Close()
 		os.Remove(diskPath)
 		return fmt.Errorf("conflict remote-wins download: %w", dlErr)
@@ -132,7 +133,7 @@ func (r *Resolver) applyBoth(entry *cache.FileEntry, remoteStat remote.FileInfo)
 		return fmt.Errorf("conflict both create: %w", err)
 	}
 
-	if dlErr := r.adapter.Get(entry.Path, f); dlErr != nil {
+	if dlErr := r.adapter.Get(context.Background(), entry.Path, f); dlErr != nil {
 		// Download failed — still mark conflict so the user is notified.
 		// The sidecar file is cleaned up.
 		f.Close()

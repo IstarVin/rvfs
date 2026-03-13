@@ -2,6 +2,7 @@ package download
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -27,7 +28,7 @@ func TestManagerStartAndWaitForRange(t *testing.T) {
 	t.Parallel()
 	content := bytes.Repeat([]byte("x"), 1024)
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			_, err := dest.Write(content)
 			return err
 		},
@@ -55,7 +56,7 @@ func TestManagerStartDedup(t *testing.T) {
 	// Use a blocking Get so the download stays in-progress.
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			close(started)
 			// Block until test ends.
 			<-make(chan struct{})
@@ -89,7 +90,7 @@ func TestManagerIsDownloading(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			close(started)
 			<-make(chan struct{})
 			return nil
@@ -120,7 +121,7 @@ func TestManagerCancel(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			close(started)
 			<-make(chan struct{})
 			return nil
@@ -156,7 +157,7 @@ func TestManagerHintCachedNoop(t *testing.T) {
 	t.Parallel()
 	content := bytes.Repeat([]byte("y"), 512)
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			_, err := dest.Write(content)
 			return err
 		},
@@ -182,7 +183,7 @@ func TestManagerHintCachedNoop(t *testing.T) {
 func TestManagerAlreadyCached(t *testing.T) {
 	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			return nil
 		},
 	}
@@ -221,7 +222,7 @@ func TestManagerConcurrentStarts(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			close(started)
 			<-make(chan struct{})
 			return nil
@@ -274,7 +275,7 @@ func TestManagerConcurrentStarts(t *testing.T) {
 func TestManagerMultipleFiles(t *testing.T) {
 	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			_, err := dest.Write(bytes.Repeat([]byte("z"), 256))
 			return err
 		},
@@ -314,7 +315,7 @@ func TestManagerMultipleFiles(t *testing.T) {
 func TestManagerDownloadError(t *testing.T) {
 	t.Parallel()
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(path string, dest io.Writer) error {
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
 			return io.ErrUnexpectedEOF
 		},
 	}
@@ -341,4 +342,73 @@ func TestManagerCancelIdempotent(t *testing.T) {
 	// Cancel a path that was never started — should not panic.
 	mgr.Cancel("nonexistent.bin")
 	mgr.Cancel("nonexistent.bin")
+}
+
+// ---------- Phase-4 tests ----------
+
+// TestDownloadNetworkErrorMidStream verifies that a mid-stream I/O error from
+// the adapter is propagated via WaitForRange and that the download is removed
+// from the manager.
+func TestDownloadNetworkErrorMidStream(t *testing.T) {
+	t.Parallel()
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+			// Write partial content then fail.
+			_, _ = dest.Write(bytes.Repeat([]byte("x"), 128))
+			return io.ErrUnexpectedEOF
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "partial.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: 1024,
+	}))
+
+	_, f, err := mgr.Start("partial.bin", 1024)
+	require.NoError(t, err)
+	defer f.Close()
+
+	err = mgr.WaitForRange("partial.bin", 0, 1024)
+	assert.Error(t, err, "WaitForRange should propagate mid-stream error")
+	assert.False(t, mgr.IsDownloading("partial.bin"),
+		"download should be removed from manager after error")
+}
+
+// TestDownloadContextCancelledOnDone verifies that calling Cancel on an active
+// download causes the adapter Get context to be cancelled.
+func TestDownloadContextCancelledOnDone(t *testing.T) {
+	t.Parallel()
+
+	ctxCancelled := make(chan error, 1)
+	started := make(chan struct{})
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			close(started)
+			<-ctx.Done()
+			ctxCancelled <- ctx.Err()
+			return ctx.Err()
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "cancel-ctx.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: 4096,
+	}))
+
+	_, f, err := mgr.Start("cancel-ctx.bin", 4096)
+	require.NoError(t, err)
+	defer f.Close()
+
+	<-started
+	mgr.Cancel("cancel-ctx.bin")
+
+	select {
+	case ctxErr := <-ctxCancelled:
+		assert.Equal(t, context.Canceled, ctxErr,
+			"adapter ctx should be cancelled when download is cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter Get context was not cancelled after Cancel()")
+	}
 }

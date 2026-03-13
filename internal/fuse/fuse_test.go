@@ -1,8 +1,10 @@
 package fuse_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -225,4 +227,49 @@ func TestCpInodeStability(t *testing.T) {
 	copied, err := os.ReadFile(dst)
 	require.NoError(t, err)
 	assert.Equal(t, data, copied)
+}
+
+// TestConcurrentWritesSameFile verifies that two goroutines writing
+// non-overlapping byte ranges to the same file do not corrupt each other's
+// data, exercising the per-file write mutex in the FUSE layer.
+func TestConcurrentWritesSameFile(t *testing.T) {
+	t.Parallel()
+	mnt := mountForTest(t)
+
+	path := filepath.Join(mnt, "shared.bin")
+	const half = 512
+	full := make([]byte, half*2)
+
+	// Create the file with zeroed content first.
+	require.NoError(t, os.WriteFile(path, full, 0644))
+
+	aData := bytes.Repeat([]byte("A"), half)
+	bData := bytes.Repeat([]byte("B"), half)
+
+	// Two goroutines write to different halves simultaneously.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+		_, err = f.WriteAt(aData, 0)
+		require.NoError(t, err)
+	}()
+	go func() {
+		defer wg.Done()
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+		_, err = f.WriteAt(bData, half)
+		require.NoError(t, err)
+	}()
+	wg.Wait()
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Len(t, got, half*2)
+	assert.Equal(t, aData, got[:half], "first half should be all A")
+	assert.Equal(t, bData, got[half:], "second half should be all B")
 }

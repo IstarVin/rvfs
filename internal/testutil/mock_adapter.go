@@ -25,34 +25,34 @@ type MockRemoteAdapter struct {
 	// Configurable return values. When a Func field is set it takes priority;
 	// otherwise the corresponding Err / result field is returned.
 
-	ListFunc  func(path string) ([]remote.FileInfo, error)
+	ListFunc  func(ctx context.Context, path string) ([]remote.FileInfo, error)
 	ListItems []remote.FileInfo
 	ListErr   error
 
-	StatFunc   func(path string) (remote.FileInfo, error)
+	StatFunc   func(ctx context.Context, path string) (remote.FileInfo, error)
 	StatResult remote.FileInfo
 	StatErr    error
 
-	GetFunc func(path string, dest io.Writer) error
+	GetFunc func(ctx context.Context, path string, dest io.Writer) error
 	GetData []byte // written to dest on success
 	GetErr  error
 
-	GetRangeFunc func(path string, offset, length int64, dest io.Writer) error
+	GetRangeFunc func(ctx context.Context, path string, offset, length int64, dest io.Writer) error
 	GetRangeErr  error
 
 	PutFunc func(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error
 	PutErr  error
 
-	DeleteFunc func(path string) error
+	DeleteFunc func(ctx context.Context, path string) error
 	DeleteErr  error
 
-	MkdirFunc func(path string) error
+	MkdirFunc func(ctx context.Context, path string) error
 	MkdirErr  error
 
-	RenameFunc func(src, dst string) error
+	RenameFunc func(ctx context.Context, src, dst string) error
 	RenameErr  error
 
-	ProbeFunc func() error
+	ProbeFunc func(ctx context.Context) error
 	ProbeErrs []error // scripted sequence; exhausted → nil
 	probeIdx  int
 
@@ -85,32 +85,32 @@ func (m *MockRemoteAdapter) CallsFor(method string) []Call {
 	return out
 }
 
-func (m *MockRemoteAdapter) List(path string) ([]remote.FileInfo, error) {
+func (m *MockRemoteAdapter) List(ctx context.Context, path string) ([]remote.FileInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("List", path)
 	if m.ListFunc != nil {
-		return m.ListFunc(path)
+		return m.ListFunc(ctx, path)
 	}
 	return m.ListItems, m.ListErr
 }
 
-func (m *MockRemoteAdapter) Stat(path string) (remote.FileInfo, error) {
+func (m *MockRemoteAdapter) Stat(ctx context.Context, path string) (remote.FileInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Stat", path)
 	if m.StatFunc != nil {
-		return m.StatFunc(path)
+		return m.StatFunc(ctx, path)
 	}
 	return m.StatResult, m.StatErr
 }
 
-func (m *MockRemoteAdapter) Get(path string, dest io.Writer) error {
+func (m *MockRemoteAdapter) Get(ctx context.Context, path string, dest io.Writer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Get", path)
 	if m.GetFunc != nil {
-		return m.GetFunc(path, dest)
+		return m.GetFunc(ctx, path, dest)
 	}
 	if m.GetData != nil {
 		if _, err := dest.Write(m.GetData); err != nil {
@@ -120,12 +120,12 @@ func (m *MockRemoteAdapter) Get(path string, dest io.Writer) error {
 	return m.GetErr
 }
 
-func (m *MockRemoteAdapter) GetRange(path string, offset, length int64, dest io.Writer) error {
+func (m *MockRemoteAdapter) GetRange(ctx context.Context, path string, offset, length int64, dest io.Writer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("GetRange", path, offset, length)
 	if m.GetRangeFunc != nil {
-		return m.GetRangeFunc(path, offset, length, dest)
+		return m.GetRangeFunc(ctx, path, offset, length, dest)
 	}
 	return m.GetRangeErr
 }
@@ -140,42 +140,42 @@ func (m *MockRemoteAdapter) Put(ctx context.Context, path string, src io.Reader,
 	return m.PutErr
 }
 
-func (m *MockRemoteAdapter) Delete(path string) error {
+func (m *MockRemoteAdapter) Delete(ctx context.Context, path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Delete", path)
 	if m.DeleteFunc != nil {
-		return m.DeleteFunc(path)
+		return m.DeleteFunc(ctx, path)
 	}
 	return m.DeleteErr
 }
 
-func (m *MockRemoteAdapter) Mkdir(path string) error {
+func (m *MockRemoteAdapter) Mkdir(ctx context.Context, path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Mkdir", path)
 	if m.MkdirFunc != nil {
-		return m.MkdirFunc(path)
+		return m.MkdirFunc(ctx, path)
 	}
 	return m.MkdirErr
 }
 
-func (m *MockRemoteAdapter) Rename(src, dst string) error {
+func (m *MockRemoteAdapter) Rename(ctx context.Context, src, dst string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Rename", src, dst)
 	if m.RenameFunc != nil {
-		return m.RenameFunc(src, dst)
+		return m.RenameFunc(ctx, src, dst)
 	}
 	return m.RenameErr
 }
 
-func (m *MockRemoteAdapter) Probe() error {
+func (m *MockRemoteAdapter) Probe(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("Probe")
 	if m.ProbeFunc != nil {
-		return m.ProbeFunc()
+		return m.ProbeFunc(ctx)
 	}
 	if m.probeIdx < len(m.ProbeErrs) {
 		err := m.ProbeErrs[m.probeIdx]
