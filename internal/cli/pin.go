@@ -4,22 +4,34 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
 
 var pinCmd = &cobra.Command{
-	Use:   "pin <source> <path>",
+	Use:   "pin (<source> <path> | <mount-path>)",
 	Short: "Pin a file so it is never evicted from the cache",
-	Args:  cobra.ExactArgs(2),
+	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, _, cl, err := resolveSource(args[0])
-		if err != nil {
-			return err
+		var cl *cache.CacheLayer
+		var rel string
+		var err error
+
+		if len(args) == 1 {
+			_, _, cl, rel, err = resolveMountPath(args[0])
+			if err != nil {
+				return err
+			}
+		} else {
+			_, _, cl, err = resolveSource(args[0])
+			if err != nil {
+				return err
+			}
+			rel = filepath.Clean(args[1])
 		}
 		defer cl.Close()
 
-		rel := filepath.Clean(args[1])
 		if err := cl.DB().SetPinned(rel, true); err != nil {
 			return fmt.Errorf("pin %q: %w", rel, err)
 		}
@@ -29,17 +41,28 @@ var pinCmd = &cobra.Command{
 }
 
 var unpinCmd = &cobra.Command{
-	Use:   "unpin <source> <path>",
+	Use:   "unpin (<source> <path> | <mount-path>)",
 	Short: "Unpin a file, allowing it to be evicted from the cache",
-	Args:  cobra.ExactArgs(2),
+	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, _, cl, err := resolveSource(args[0])
-		if err != nil {
-			return err
+		var cl *cache.CacheLayer
+		var rel string
+		var err error
+
+		if len(args) == 1 {
+			_, _, cl, rel, err = resolveMountPath(args[0])
+			if err != nil {
+				return err
+			}
+		} else {
+			_, _, cl, err = resolveSource(args[0])
+			if err != nil {
+				return err
+			}
+			rel = filepath.Clean(args[1])
 		}
 		defer cl.Close()
 
-		rel := filepath.Clean(args[1])
 		if err := cl.DB().SetPinned(rel, false); err != nil {
 			return fmt.Errorf("unpin %q: %w", rel, err)
 		}
@@ -49,18 +72,31 @@ var unpinCmd = &cobra.Command{
 }
 
 var pinsCmd = &cobra.Command{
-	Use:   "pins [source]",
+	Use:   "pins [source | mount-path]",
 	Short: "List pinned paths",
 	Long: `List all pinned paths for a remote.
 
-  rvfs pins gdrive:Documents`,
+  rvfs pins gdrive:Documents
+  rvfs pins /mnt/gdrive`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return listAllPins()
 		}
+		if filepath.IsAbs(args[0]) {
+			return listPinsByMount(args[0])
+		}
 		return listPins(args[0])
 	},
+}
+
+func listPinsByMount(path string) error {
+	_, _, cl, _, err := resolveMountPath(path)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	return printPins(cl)
 }
 
 func listPins(source string) error {
@@ -69,6 +105,10 @@ func listPins(source string) error {
 		return err
 	}
 	defer cl.Close()
+	return printPins(cl)
+}
+
+func printPins(cl *cache.CacheLayer) error {
 
 	pins, err := cl.DB().ListPinned()
 	if err != nil {
