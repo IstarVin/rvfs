@@ -696,7 +696,11 @@ func (dl *Download) persistRangesLocked(state cache.FileState) {
 		entry, err := dl.mgr.cache.Stat(dl.path)
 		if err == nil && entry != nil {
 			entry.CachedRanges = string(rangesJSON)
-			entry.State = state
+			// Background range checkpoints must never downgrade a terminal state
+			// (e.g. Evicted/Clean) back to Downloading due to async races.
+			if state != cache.StateDownloading || entry.State == cache.StateDownloading {
+				entry.State = state
+			}
 			_ = dl.mgr.cache.DB().PutFile(entry)
 		}
 	}()
@@ -749,11 +753,17 @@ func (dl *Download) cancel() {
 		dl.err = fmt.Errorf("download cancelled")
 	}
 	dl.cond.Broadcast()
-
-	// Persist partial ranges and transition the DB state to StateEvicted so
-	// the next Open() after reconnection resumes cleanly.
-	dl.persistRangesLocked(cache.StateEvicted)
+	rangesJSON, _ := dl.rangeSet.MarshalJSON()
 	dl.mu.Unlock()
+
+	// Persist partial ranges synchronously and transition the DB state to
+	// StateEvicted before returning so process exit cannot lose this write.
+	entry, err := dl.mgr.cache.Stat(dl.path)
+	if err == nil && entry != nil {
+		entry.CachedRanges = string(rangesJSON)
+		entry.State = cache.StateEvicted
+		_ = dl.mgr.cache.DB().PutFile(entry)
+	}
 
 	dl.cacheFile.Close()
 }

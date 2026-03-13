@@ -524,6 +524,40 @@ func TestManagerCancelledHelperGoroutineIsNotFatal(t *testing.T) {
 	}, 8*time.Second, 20*time.Millisecond, "download should complete and be marked clean")
 }
 
+func TestReleaseReaderCancelMarksEvicted(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{ReadAhead: 1})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "release-cancel.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: 4096,
+	}))
+
+	dl, f, err := mgr.Start("release-cancel.bin", 4096)
+	require.NoError(t, err)
+	defer f.Close()
+
+	<-started
+	dl.ReleaseReader()
+
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("release-cancel.bin")
+		return err == nil && e != nil && e.State == cache.StateEvicted
+	}, 2*time.Second, 10*time.Millisecond, "release-triggered cancel should persist StateEvicted")
+
+	assert.False(t, mgr.IsDownloading("release-cancel.bin"), "download should be removed after release-triggered cancel")
+}
+
 // TestManagerSeekRedirectsDownload verifies that when a single reader seeks
 // to a distant offset, all existing goroutines are cancelled and a new
 // sequential goroutine starts from the seek position, focusing bandwidth on
