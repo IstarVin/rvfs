@@ -447,10 +447,18 @@ func (dl *Download) waitForRange(offset, size int64) error {
 	if len(dl.goroutines) == 0 {
 		dl.spawnGoroutine(offset, true)
 	} else if !dl.hasGoroutineNear(offset) {
-		// Spawn an on-demand goroutine if no goroutine is close to the
-		// requested offset. This enables immediate streaming from any
-		// position instead of waiting for the sequential goroutine.
-		dl.spawnGoroutine(offset, false)
+		if dl.openCount.Load() == 1 {
+			// Single reader seeking to a distant position — redirect all
+			// goroutines so bandwidth is focused on what is being read.
+			for _, gi := range dl.goroutines {
+				gi.cancel()
+			}
+			dl.spawnGoroutine(offset, true)
+		} else {
+			// Multiple readers at different positions — keep existing
+			// goroutines running and add a secondary one for this reader.
+			dl.spawnGoroutine(offset, false)
+		}
 	}
 
 	// Cancel far-behind non-sequential goroutines to save bandwidth.

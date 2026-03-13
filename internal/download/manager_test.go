@@ -523,3 +523,78 @@ func TestManagerCancelledHelperGoroutineIsNotFatal(t *testing.T) {
 		return err == nil && e != nil && e.State == cache.StateClean
 	}, 8*time.Second, 20*time.Millisecond, "download should complete and be marked clean")
 }
+
+// TestManagerSeekRedirectsDownload verifies that when a single reader seeks
+// to a distant offset, all existing goroutines are cancelled and a new
+// sequential goroutine starts from the seek position, focusing bandwidth on
+// the data actually being read.
+func TestManagerSeekRedirectsDownload(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(20 * 1024 * 1024)  // 20 MiB
+	const seekOffset = int64(10 * 1024 * 1024) // seek to 10 MiB
+
+	// rangeCh records every (offset, length) pair requested via GetRange.
+	type rangeReq struct{ offset, length int64 }
+	rangeCh := make(chan rangeReq, 16)
+
+	blockCh := make(chan struct{}) // lets the initial Get block until we seek
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			// Block until cancelled so the sequential goroutine is still
+			// running when we trigger the seek.
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		GetRangeFunc: func(ctx context.Context, path string, offset, length int64, dest io.Writer) error {
+			rangeCh <- rangeReq{offset, length}
+			close(blockCh)
+			// Stream enough data for WaitForRange to unblock.
+			chunk := make([]byte, 128*1024)
+			for written := int64(0); written < length; {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				n := int64(len(chunk))
+				if remaining := length - written; remaining < n {
+					n = remaining
+				}
+				if _, err := dest.Write(chunk[:n]); err != nil {
+					return err
+				}
+				written += n
+			}
+			return nil
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "seek.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	_, f, err := mgr.Start("seek.bin", totalSize)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Simulate a seek: WaitForRange at the distant offset with a single reader.
+	// This should cancel the sequential goroutine from byte 0 and start a new
+	// sequential goroutine beginning at seekOffset.
+	require.NoError(t, mgr.WaitForRange("seek.bin", seekOffset, 1))
+
+	// A GetRange call for the seek offset must have been issued.
+	select {
+	case req := <-rangeCh:
+		assert.Equal(t, seekOffset, req.offset,
+			"GetRange should be called at the seek offset, not at byte 0")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a GetRange call at the seek offset")
+	}
+
+	mgr.Cancel("seek.bin")
+}
