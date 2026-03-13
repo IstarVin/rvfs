@@ -380,6 +380,89 @@ func TestDeleteDriveID(t *testing.T) {
 	assert.Empty(t, id)
 }
 
+// ---------- CheckpointRanges tests ----------
+
+// TestCheckpointRangesUpdatesWhenDownloading verifies that CheckpointRanges
+// writes the new cached_ranges value when the entry is still in StateDownloading.
+func TestCheckpointRangesUpdatesWhenDownloading(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	require.NoError(t, db.PutFile(&FileEntry{
+		Path:  "dl.bin",
+		Mode:  0100644,
+		State: StateDownloading,
+	}))
+
+	require.NoError(t, db.CheckpointRanges("dl.bin", "[[0,1024]]"))
+
+	got, err := db.GetFile("dl.bin")
+	require.NoError(t, err)
+	assert.Equal(t, "[[0,1024]]", got.CachedRanges)
+	assert.Equal(t, StateDownloading, got.State,
+		"CheckpointRanges must not change state away from StateDownloading")
+}
+
+// TestCheckpointRangesNoOpWhenStateClean verifies that CheckpointRanges is a
+// complete no-op when the entry has already been promoted to StateClean.
+// This guards against the race where a background checkpoint goroutine
+// launched before finish() overwrites the terminal StateClean back to
+// StateDownloading.
+func TestCheckpointRangesNoOpWhenStateClean(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	require.NoError(t, db.PutFile(&FileEntry{
+		Path:         "clean.bin",
+		Mode:         0100644,
+		State:        StateClean,
+		CachedRanges: "[[0,4096]]",
+	}))
+
+	// Simulate a stale checkpoint call arriving after finish() has already set
+	// the entry to StateClean.
+	require.NoError(t, db.CheckpointRanges("clean.bin", "[[0,2048]]"))
+
+	got, err := db.GetFile("clean.bin")
+	require.NoError(t, err)
+	assert.Equal(t, StateClean, got.State,
+		"CheckpointRanges must not downgrade StateClean")
+	assert.Equal(t, "[[0,4096]]", got.CachedRanges,
+		"CheckpointRanges must not overwrite cached_ranges when state is clean")
+}
+
+// TestCheckpointRangesNoOpWhenStateEvicted verifies that CheckpointRanges is a
+// no-op when the entry has been transitioned to StateEvicted (e.g. after Cancel).
+func TestCheckpointRangesNoOpWhenStateEvicted(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	require.NoError(t, db.PutFile(&FileEntry{
+		Path:         "evicted.bin",
+		Mode:         0100644,
+		State:        StateEvicted,
+		CachedRanges: "[[0,512]]",
+	}))
+
+	require.NoError(t, db.CheckpointRanges("evicted.bin", "[[0,256]]"))
+
+	got, err := db.GetFile("evicted.bin")
+	require.NoError(t, err)
+	assert.Equal(t, StateEvicted, got.State,
+		"CheckpointRanges must not downgrade StateEvicted")
+	assert.Equal(t, "[[0,512]]", got.CachedRanges,
+		"CheckpointRanges must not overwrite cached_ranges when state is evicted")
+}
+
+// TestCheckpointRangesNoOpForUnknownPath verifies that CheckpointRanges on a
+// path that does not exist returns nil (not an error) — the UPDATE silently
+// matches zero rows.
+func TestCheckpointRangesNoOpForUnknownPath(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	assert.NoError(t, db.CheckpointRanges("ghost.bin", "[[0,64]]"))
+}
+
 func TestDeleteDriveIDsByPrefix(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)

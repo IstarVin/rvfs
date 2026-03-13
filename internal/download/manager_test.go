@@ -558,7 +558,120 @@ func TestReleaseReaderCancelMarksEvicted(t *testing.T) {
 	assert.False(t, mgr.IsDownloading("release-cancel.bin"), "download should be removed after release-triggered cancel")
 }
 
-// TestManagerSeekRedirectsDownload verifies that when a single reader seeks
+// ---------- Checkpoint-race regression tests ----------
+
+// TestFinishSetsStateClean verifies that after a download completes the DB
+// entry is in StateClean. This is the basic postcondition checked by the pin
+// workflow.
+func TestFinishSetsStateClean(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(512)
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, _ string, dest io.Writer) error {
+			_, err := dest.Write(bytes.Repeat([]byte("a"), int(totalSize)))
+			return err
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "clean-after.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	require.NoError(t, mgr.Prefetch("clean-after.bin", totalSize))
+
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("clean-after.bin")
+		return err == nil && e != nil && e.State == cache.StateClean
+	}, 5*time.Second, 10*time.Millisecond, "state must be StateClean after download completes")
+
+	assert.False(t, mgr.IsDownloading("clean-after.bin"),
+		"download must be removed from manager after completion")
+}
+
+// TestFinishSetsStateCleanWithCheckpoints verifies StateClean even when
+// periodic range checkpoints fire during the download. The file is large enough
+// (>persistBytes = 5 MiB) to guarantee at least one checkpoint flush, which is
+// exactly the scenario that triggered the TOCTOU race before the fix.
+func TestFinishSetsStateCleanWithCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	// 6 MiB — exceeds the 5 MiB persistBytes threshold so at least one
+	// background checkpoint goroutine will be launched while downloading.
+	const totalSize = int64(6 * 1024 * 1024)
+	content := bytes.Repeat([]byte("b"), int(totalSize))
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, _ string, dest io.Writer) error {
+			_, err := dest.Write(content)
+			return err
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "checkpoint-race.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	require.NoError(t, mgr.Prefetch("checkpoint-race.bin", totalSize))
+
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("checkpoint-race.bin")
+		return err == nil && e != nil && e.State == cache.StateClean
+	}, 10*time.Second, 20*time.Millisecond,
+		"state must remain StateClean even when checkpoint goroutines race with finish()")
+
+	// Double-check the state has not been downgraded to StateDownloading by a
+	// stale checkpoint goroutine that outlived finish().
+	e, err := cl.Stat("checkpoint-race.bin")
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	assert.Equal(t, cache.StateClean, e.State,
+		"a racing checkpoint must never downgrade StateClean to StateDownloading")
+}
+
+// TestCheckpointAfterFinishDoesNotDowngradeState exercises the exact race path
+// at the DB level: simulate finish() writing StateClean and then a stale
+// checkpoint arriving afterwards. The state must remain StateClean.
+func TestCheckpointAfterFinishDoesNotDowngradeState(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(512)
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, _ string, dest io.Writer) error {
+			_, err := dest.Write(bytes.Repeat([]byte("c"), int(totalSize)))
+			return err
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "stale-checkpoint.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	require.NoError(t, mgr.Prefetch("stale-checkpoint.bin", totalSize))
+
+	// Wait until the download completes and finish() has written StateClean.
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("stale-checkpoint.bin")
+		return err == nil && e != nil && e.State == cache.StateClean
+	}, 5*time.Second, 10*time.Millisecond, "download must complete first")
+
+	// Now fire a stale checkpoint (mimics a background goroutine that was
+	// launched just before finish() and arrived late).
+	require.NoError(t, cl.DB().CheckpointRanges("stale-checkpoint.bin", "[[0,256]]"))
+
+	e, err := cl.Stat("stale-checkpoint.bin")
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	assert.Equal(t, cache.StateClean, e.State,
+		"stale CheckpointRanges must not revert StateClean")
+}
+
 // to a distant offset, all existing goroutines are cancelled and a new
 // sequential goroutine starts from the seek position, focusing bandwidth on
 // the data actually being read.

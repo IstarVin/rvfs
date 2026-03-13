@@ -605,7 +605,7 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 
 			// Periodically persist CachedRanges to DB for crash recovery.
 			if dl.bytesSincePersit >= persistBytes || time.Since(dl.lastPersist) >= persistInterval {
-				dl.persistRangesLocked(cache.StateDownloading)
+				dl.persistRangesLocked()
 			}
 
 			// Stop if the next chunk is already downloaded (another
@@ -684,25 +684,19 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 	}
 }
 
-// persistRangesLocked writes the current CachedRanges to the DB with the
-// given target state. Must be called with dl.mu held.
-func (dl *Download) persistRangesLocked(state cache.FileState) {
+// persistRangesLocked checkpoints the current CachedRanges to the DB.
+// Must be called with dl.mu held.
+// The update is a targeted single-statement UPDATE that only fires while the
+// row's state is still 'downloading', so it can never race with finish() or
+// cancel() and overwrite a terminal state (StateClean / StateEvicted).
+func (dl *Download) persistRangesLocked() {
 	rangesJSON, _ := dl.rangeSet.MarshalJSON()
 	dl.lastPersist = time.Now()
 	dl.bytesSincePersit = 0
 
 	// Run DB update without holding the download lock.
 	go func() {
-		entry, err := dl.mgr.cache.Stat(dl.path)
-		if err == nil && entry != nil {
-			entry.CachedRanges = string(rangesJSON)
-			// Background range checkpoints must never downgrade a terminal state
-			// (e.g. Evicted/Clean) back to Downloading due to async races.
-			if state != cache.StateDownloading || entry.State == cache.StateDownloading {
-				entry.State = state
-			}
-			_ = dl.mgr.cache.DB().PutFile(entry)
-		}
+		_ = dl.mgr.cache.DB().CheckpointRanges(dl.path, string(rangesJSON))
 	}()
 }
 

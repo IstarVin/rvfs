@@ -632,6 +632,19 @@ func (m *MetadataDB) SetPinnedMany(paths []string, pinned bool) error {
 	return nil
 }
 
+// CheckpointRanges updates the cached_ranges column only when the row is still
+// in StateDownloading. This is an atomic single-statement update so it cannot
+// race with finish() or cancel() and accidentally overwrite a terminal state.
+func (m *MetadataDB) CheckpointRanges(path, cachedRanges string) error {
+	_, err := m.db.Exec(
+		`UPDATE files SET cached_ranges = ? WHERE path = ? AND state = 'downloading'`,
+		cachedRanges, path)
+	if err != nil {
+		return fmt.Errorf("checkpoint ranges %q: %w", path, err)
+	}
+	return nil
+}
+
 // UpdateLastAccess sets last_access to ts (Unix seconds) for the given path.
 // Errors are silently ignored by callers — best-effort tracking.
 func (m *MetadataDB) UpdateLastAccess(path string, ts int64) error {
