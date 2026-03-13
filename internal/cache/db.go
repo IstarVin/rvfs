@@ -77,6 +77,11 @@ func OpenDB(dbPath string) (*MetadataDB, error) {
 		db.Close()
 		return nil, fmt.Errorf("set WAL: %w", err)
 	}
+	// Wait for a lock to clear instead of failing immediately with SQLITE_BUSY.
+	if _, err := db.Exec("PRAGMA busy_timeout=10000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
+	}
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set foreign_keys: %w", err)

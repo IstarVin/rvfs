@@ -475,28 +475,29 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string, sr *startu
 		}
 	}
 
-	// All startup infrastructure is ready — signal the parent daemon-watcher
-	// so it can detach. Post-startup logs continue to the daemon log file.
-	label := remoteName + ":" + remotePath
-	slog.Info("mounted", "source", label, "mountpoint", mountpoint)
-	sr.ready()
-
 	// Start LRU evictor.
 	evCtx, evCancel := context.WithCancel(context.Background())
 	defer evCancel()
 	ev := &cache.Evictor{MaxSize: mountCacheSize, MaxAge: mountCacheMaxAge, MinFreeSpace: mountCacheMinFreeSpace}
 	go ev.Run(evCtx, cl)
 
-	// Do an initial pull only when the local metadata DB is empty.
-	// If data is already present, the background sync engine will handle
-	// any remote changes without blocking the mount.
+	// On first mount (no entries in the metadata DB), perform an initial pull
+	// before signalling ready — this blocks the parent until the sync
+	// completes so the mountpoint is fully populated when the command returns.
 	if hasData, err := cl.DB().HasFiles(); err != nil {
 		slog.Warn("checking cache state failed", "err", err)
 	} else if !hasData {
+		slog.Info("first mount: running initial sync before ready")
 		if err := engine.PullOnce(); err != nil {
 			slog.Warn("initial pull failed", "err", err)
 		}
 	}
+
+	// All startup infrastructure is ready — signal the parent daemon-watcher
+	// so it can detach. Post-startup logs continue to the daemon log file.
+	label := remoteName + ":" + remotePath
+	slog.Info("mounted", "source", label, "mountpoint", mountpoint)
+	sr.ready()
 
 	server.Wait()
 	engine.Stop()

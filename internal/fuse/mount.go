@@ -100,6 +100,7 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 			Debug:       opts.Debug,
 			Name:        fsName,
 			FsName:      remoteID,
+			AllowOther:  true,
 			MaxWrite:    1 << 20, // 1 MiB write buffer
 			EnableLocks: true,
 		},
