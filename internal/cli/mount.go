@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
@@ -44,6 +45,7 @@ var (
 	mountCacheSize         int64
 	mountCacheMaxAge       time.Duration
 	mountCacheMinFreeSpace int64
+	mountDaemonFd          int
 )
 
 var mountCmd = &cobra.Command{
@@ -148,27 +150,156 @@ For a configured remote:
 
 		// Daemonize by re-launching with --foreground unless already in foreground.
 		if !mountForeground {
-			newArgs := append(os.Args[1:], "--foreground")
-			cmd := exec.Command(os.Args[0], newArgs...)
-			cmd.Stdin = nil
-			cmd.Stdout = nil
-			cmd.Stderr = nil
-			if err := cmd.Start(); err != nil {
+			statusR, statusW, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				return fmt.Errorf("daemonize: create startup pipe: %w", pipeErr)
+			}
+			newArgs := append(os.Args[1:], "--foreground", "--daemon-fd=3")
+			daemonCmd := exec.Command(os.Args[0], newArgs...)
+			daemonCmd.Stdin = nil
+			daemonCmd.Stdout = nil
+			daemonCmd.Stderr = nil
+			daemonCmd.ExtraFiles = []*os.File{statusW} // becomes fd 3 in child
+			daemonCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			if err := daemonCmd.Start(); err != nil {
+				statusR.Close()
+				statusW.Close()
 				return fmt.Errorf("daemonize: %w", err)
 			}
-			fmt.Fprintf(os.Stdout, "rvfs daemon started (pid %d)\n", cmd.Process.Pid)
+			statusW.Close() // parent only reads
+			fatalMsg, warnings := readDaemonStartup(statusR)
+			statusR.Close()
+			for _, w := range warnings {
+				fmt.Fprintln(os.Stderr, "warning:", w)
+			}
+			if fatalMsg != "" {
+				_ = daemonCmd.Process.Kill()
+				return fmt.Errorf("%s", fatalMsg)
+			}
+			fmt.Fprintf(os.Stdout, "rvfs daemon started (pid %d)\n", daemonCmd.Process.Pid)
 			return nil
 		}
 
-		// Determine if source is a remote (contains ':') or a local path.
-		if before, after, ok := strings.Cut(source, ":"); ok {
-			return mountRemote(before, after, mountpoint, cacheDir)
+		// Set up startup reporter when spawned as a daemon child (--daemon-fd set by parent).
+		sr := newStartupReporter(mountDaemonFd)
+		defer sr.close()
+
+		// In daemon-child mode, redirect slog to a per-remote log file so
+		// post-detach diagnostics are not silently discarded.
+		if sr != nil {
+			var logRemoteID string
+			if before, _, ok := strings.Cut(source, ":"); ok {
+				logRemoteID = before
+			} else {
+				logRemoteID = filepath.Base(source)
+			}
+			logDir := filepath.Join(cacheDir, logRemoteID)
+			if err := os.MkdirAll(logDir, 0755); err == nil {
+				logPath := filepath.Join(logDir, "daemon.log")
+				if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+					slog.SetDefault(slog.New(slog.NewTextHandler(lf, &slog.HandlerOptions{Level: logLevel})))
+				} else {
+					sr.warn(fmt.Sprintf("could not open daemon log: %v", err))
+				}
+			}
 		}
-		return mountLocal(source, mountpoint, cacheDir)
+
+		// Determine if source is a remote (contains ':') or a local path.
+		var mountErr error
+		if before, after, ok := strings.Cut(source, ":"); ok {
+			mountErr = mountRemote(before, after, mountpoint, cacheDir, sr)
+		} else {
+			mountErr = mountLocal(source, mountpoint, cacheDir, sr)
+		}
+		if mountErr != nil {
+			sr.fatal(mountErr.Error())
+			return mountErr
+		}
+		return nil
 	},
 }
 
-func mountLocal(backingDir, mountpoint, cacheDir string) error {
+// startupReporter sends structured startup events to the parent daemon-watcher
+// via an inherited file descriptor. A nil receiver is always safe (all methods
+// are no-ops), which keeps --foreground-without-parent usage unchanged.
+type startupReporter struct {
+	w      *bufio.Writer
+	f      *os.File
+	closed bool
+}
+
+// newStartupReporter returns a reporter writing to fd, or nil if fd < 0.
+func newStartupReporter(fd int) *startupReporter {
+	if fd < 0 {
+		return nil
+	}
+	f := os.NewFile(uintptr(fd), "startup-report")
+	return &startupReporter{w: bufio.NewWriter(f), f: f}
+}
+
+func (r *startupReporter) warn(msg string) {
+	if r == nil || r.closed {
+		return
+	}
+	fmt.Fprintf(r.w, "WARN:%s\n", strings.ReplaceAll(msg, "\n", " "))
+	r.w.Flush()
+}
+
+func (r *startupReporter) fatal(msg string) {
+	if r == nil || r.closed {
+		return
+	}
+	r.closed = true
+	fmt.Fprintf(r.w, "FATAL:%s\n", strings.ReplaceAll(msg, "\n", " "))
+	r.w.Flush()
+	r.f.Close()
+}
+
+func (r *startupReporter) ready() {
+	if r == nil || r.closed {
+		return
+	}
+	r.closed = true
+	fmt.Fprintf(r.w, "READY\n")
+	r.w.Flush()
+	r.f.Close()
+}
+
+// close is a safety-net finaliser called via defer in RunE. It closes the pipe
+// without sending any event, producing EOF on the parent's read end which it
+// treats as an unexpected exit. It is a no-op when ready or fatal already fired.
+func (r *startupReporter) close() {
+	if r == nil || r.closed {
+		return
+	}
+	r.closed = true
+	r.f.Close()
+}
+
+// readDaemonStartup reads startup events from the child's pipe until the child
+// signals READY or FATAL, or the pipe closes unexpectedly (child crashed).
+// Returns ("", warnings) on success or (fatalMsg, warnings) on failure.
+func readDaemonStartup(r *os.File) (fatalMsg string, warnings []string) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "READY":
+			return "", warnings
+		case strings.HasPrefix(line, "FATAL:"):
+			fatalMsg = strings.TrimPrefix(line, "FATAL:")
+		case strings.HasPrefix(line, "WARN:"):
+			warnings = append(warnings, strings.TrimPrefix(line, "WARN:"))
+		}
+	}
+	// EOF: child sent FATAL then closed the pipe, or exited unexpectedly.
+	if fatalMsg == "" {
+		fatalMsg = "daemon exited before signalling ready"
+	}
+	return fatalMsg, warnings
+}
+
+func mountLocal(backingDir, mountpoint, cacheDir string, sr *startupReporter) error {
 	remoteID := filepath.Base(backingDir)
 
 	cl, server, err := fuse.Mount(cacheDir, remoteID, mountpoint, fuse.MountOptions{
@@ -185,12 +316,13 @@ func mountLocal(backingDir, mountpoint, cacheDir string) error {
 	}
 
 	slog.Info("mounted", "source", backingDir, "mountpoint", mountpoint)
+	sr.ready()
 	server.Wait()
 	cl.Close()
 	return nil
 }
 
-func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
+func mountRemote(remoteName, remotePath, mountpoint, cacheDir string, sr *startupReporter) error {
 	absMountpoint, err := filepath.Abs(mountpoint)
 	if err != nil {
 		return fmt.Errorf("resolve mountpoint: %w", err)
@@ -200,6 +332,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	reg, regErr := ipc.OpenMountRegistry()
 	if regErr != nil {
 		slog.Warn("mount registry unavailable", "err", regErr)
+		sr.warn(fmt.Sprintf("mount registry unavailable: %v", regErr))
 		reg = nil
 	}
 	if reg != nil {
@@ -260,6 +393,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 			return fmt.Errorf("probe remote: %w", probeErr)
 		}
 		slog.Warn("remote unreachable; mounting offline from cache", "err", probeErr)
+		sr.warn(fmt.Sprintf("remote unreachable, mounting offline from cache: %v", probeErr))
 	}
 
 	// Recover any downloads that were interrupted by a previous crash.
@@ -318,6 +452,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	srv := ipc.NewServer(sockPath, h)
 	if listenErr := srv.Listen(); listenErr != nil {
 		slog.Warn("IPC server unavailable", "err", listenErr)
+		sr.warn(fmt.Sprintf("IPC server unavailable: %v", listenErr))
 	} else {
 		defer srv.Close()
 		if reg != nil {
@@ -330,11 +465,18 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 				MountedAt:  time.Now().Unix(),
 			}); regErr != nil {
 				slog.Warn("mount registry: register failed", "err", regErr)
+				sr.warn(fmt.Sprintf("mount registry: register failed: %v", regErr))
 			} else {
 				defer reg.Deregister(absMountpoint)
 			}
 		}
 	}
+
+	// All startup infrastructure is ready — signal the parent daemon-watcher
+	// so it can detach. Post-startup logs continue to the daemon log file.
+	label := remoteName + ":" + remotePath
+	slog.Info("mounted", "source", label, "mountpoint", mountpoint)
+	sr.ready()
 
 	// Start LRU evictor.
 	evCtx, evCancel := context.WithCancel(context.Background())
@@ -353,8 +495,6 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		}
 	}
 
-	label := remoteName + ":" + remotePath
-	slog.Info("mounted", "source", label, "mountpoint", mountpoint)
 	server.Wait()
 	engine.Stop()
 	cl.Close()
@@ -666,7 +806,6 @@ func init() {
 	mountConflictStrategy = "both"
 	mountCmd.Flags().StringVar(&mountConflictStrategy, "conflict", "both", "Conflict resolution strategy: both, local-wins, remote-wins, manual")
 
-	mountCacheSize = 20 * 1024 * 1024 * 1024 // 20 GiB default
 	mountCmd.Flags().Var((*byteSizeValue)(&mountCacheSize), "cache-size", "Maximum total cache size; evict clean files when exceeded (e.g. 10G, 500M); 0 = unlimited")
 
 	mountCmd.Flags().Var((*durationValue)(&mountCacheMaxAge), "cache-max-age", "Evict clean files not accessed for this long (e.g. 7d=168h, 30d=720h); 0 = disabled")
@@ -675,4 +814,7 @@ func init() {
 
 	mountCmd.Flags().BoolVar(&mountInstallService, "install-service", false, "Install OS service (systemd/launchd) to auto-start on login and exit")
 	mountCmd.Flags().BoolVar(&mountUninstallService, "uninstall-service", false, "Remove previously installed OS service and exit")
+	mountDaemonFd = -1
+	mountCmd.Flags().IntVar(&mountDaemonFd, "daemon-fd", -1, "")
+	_ = mountCmd.Flags().MarkHidden("daemon-fd")
 }
