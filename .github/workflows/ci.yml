@@ -8,7 +8,7 @@ on:
 
 jobs:
   ci:
-    name: Build, Lint & Test
+    name: Test & Build
     runs-on: ubuntu-latest
 
     steps:
@@ -27,6 +27,9 @@ jobs:
       - name: Verify dependencies
         run: go mod tidy && git diff --exit-code go.mod go.sum
 
+      - name: Test
+        run: go test -race -timeout 120s ./...
+
       - name: Build
         run: |
           mkdir -p bin
@@ -38,6 +41,3 @@ jobs:
           name: rvfs-linux-amd64
           path: bin/rvfs
           retention-days: 7
-
-      - name: Test
-        run: go test -race -timeout 120s ./...
