@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"text/tabwriter"
-	"time"
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/config"
@@ -19,7 +17,10 @@ import (
 
 // ---------- conflicts command ----------
 
-var conflictsCacheDir string
+var (
+	conflictsCacheDir string
+	conflictsJSON     bool
+)
 
 var conflictsCmd = &cobra.Command{
 	Use:   "conflicts <source>",
@@ -57,18 +58,35 @@ var conflictsCmd = &cobra.Command{
 		}
 
 		if len(conflicts) == 0 {
-			fmt.Println("No conflicts.")
+			fprintln(cmd.OutOrStdout(), "No conflicts.")
 			return nil
 		}
-
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tPATH\tLOCAL MTIME\tREMOTE MTIME")
-		for _, c := range conflicts {
-			localTime := time.Unix(c.LocalMtime, 0).Format("2006-01-02 15:04:05")
-			remoteTime := time.Unix(c.RemoteMtime, 0).Format("2006-01-02 15:04:05")
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", c.ID, c.Path, localTime, remoteTime)
+		if conflictsJSON {
+			return writeJSON(cmd.OutOrStdout(), conflicts)
 		}
-		return w.Flush()
+
+		printSection(cmd.OutOrStdout(), fmt.Sprintf("Conflicts for %s", args[0]))
+		fprintf(cmd.OutOrStdout(), "%d unresolved %s\n", len(conflicts), pluralize(len(conflicts), "conflict", "conflicts"))
+		rows := make([][]string, 0, len(conflicts))
+		for _, c := range conflicts {
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", c.ID),
+				c.Path,
+				formatTimestamp(c.LocalMtime),
+				formatTimestamp(c.RemoteMtime),
+				formatRelativeTime(c.DetectedAt),
+			})
+		}
+		renderTable(cmd.OutOrStdout(), []tableColumn{
+			{Title: "ID", Width: 5, AlignRight: true},
+			{Title: "PATH", Width: 42},
+			{Title: "LOCAL", Width: 16},
+			{Title: "REMOTE", Width: 16},
+			{Title: "DETECTED", Width: 10},
+		}, rows)
+		printHint(cmd.OutOrStdout(), "run 'rvfs resolve %s <id> --keep local|remote|both' to resolve a conflict", args[0])
+		fprintln(cmd.OutOrStdout())
+		return nil
 	},
 }
 
@@ -155,7 +173,7 @@ var resolveCmd = &cobra.Command{
 		}
 
 		if len(conflicts) == 0 {
-			fmt.Println("No conflicts to resolve.")
+			fprintln(cmd.OutOrStdout(), "No conflicts to resolve.")
 			return nil
 		}
 
@@ -170,12 +188,30 @@ var resolveCmd = &cobra.Command{
 			}
 		}
 
+		results := make([][]string, 0, len(conflicts))
+		failures := 0
 		for _, ce := range conflicts {
-			if err := applyResolution(cl, adapter, ce, resolveKeep); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: resolve %q: %v\n", ce.Path, err)
+			outcome, err := applyResolution(cl, adapter, ce, resolveKeep)
+			if err != nil {
+				failures++
+				printWarning(cmd.ErrOrStderr(), "could not resolve %q: %v", ce.Path, err)
 				continue
 			}
-			fmt.Printf("Resolved: %s\n", ce.Path)
+			results = append(results, []string{ce.Path, outcome})
+		}
+		if len(results) > 0 {
+			printSection(cmd.OutOrStdout(), fmt.Sprintf("Resolved %d %s", len(results), pluralize(len(results), "conflict", "conflicts")))
+			renderTable(cmd.OutOrStdout(), []tableColumn{
+				{Title: "PATH", Width: 42},
+				{Title: "OUTCOME", Width: 44},
+			}, results)
+			if resolveKeep == "local" {
+				printHint(cmd.OutOrStdout(), "run 'rvfs sync %s --force' to push resolved local changes sooner", args[0])
+			}
+			fprintln(cmd.OutOrStdout())
+		}
+		if failures > 0 {
+			return fmt.Errorf("%d %s failed to resolve", failures, pluralize(failures, "conflict", "conflicts"))
 		}
 		return nil
 	},
@@ -184,32 +220,36 @@ var resolveCmd = &cobra.Command{
 // applyResolution applies the chosen strategy to a single conflict entry.
 func applyResolution(cl *cache.CacheLayer, adapter interface {
 	Get(ctx context.Context, path string, dest io.Writer) error
-}, ce *cache.ConflictEntry, keep string) error {
+}, ce *cache.ConflictEntry, keep string) (string, error) {
 	switch keep {
 	case "local":
 		// Re-queue for upload; next engine cycle will upload.
 		if err := cl.DB().SetState(ce.Path, cache.StateDirty); err != nil {
-			return fmt.Errorf("set dirty: %w", err)
+			return "", fmt.Errorf("set dirty: %w", err)
 		}
+		if err := cl.DB().RemoveConflict(ce.ID); err != nil {
+			return "", err
+		}
+		return "local version queued for upload", nil
 
 	case "remote":
 		// Download remote, overwrite local cache file.
 		entry, err := cl.DB().GetFile(ce.Path)
 		if err != nil || entry == nil {
-			return fmt.Errorf("file not found in DB")
+			return "", fmt.Errorf("file not found in DB")
 		}
 		diskPath := cl.DiskPath(ce.Path)
 		if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
-			return fmt.Errorf("mkdir: %w", err)
+			return "", fmt.Errorf("mkdir: %w", err)
 		}
 		f, err := os.Create(diskPath)
 		if err != nil {
-			return fmt.Errorf("create: %w", err)
+			return "", fmt.Errorf("create: %w", err)
 		}
 		if dlErr := adapter.Get(context.Background(), ce.Path, f); dlErr != nil {
 			f.Close()
 			os.Remove(diskPath)
-			return fmt.Errorf("download: %w", dlErr)
+			return "", fmt.Errorf("download: %w", dlErr)
 		}
 		f.Close()
 		entry.State = cache.StateClean
@@ -217,8 +257,12 @@ func applyResolution(cl *cache.CacheLayer, adapter interface {
 		entry.LocalMtime = ce.RemoteMtime
 		entry.SyncError = ""
 		if err := cl.DB().PutFile(entry); err != nil {
-			return fmt.Errorf("update DB: %w", err)
+			return "", fmt.Errorf("update DB: %w", err)
 		}
+		if err := cl.DB().RemoveConflict(ce.ID); err != nil {
+			return "", err
+		}
+		return "replaced local cache with the remote version", nil
 
 	case "both":
 		// Ensure sidecar exists; if not, download it now.
@@ -226,21 +270,21 @@ func applyResolution(cl *cache.CacheLayer, adapter interface {
 		diskConflictPath := cl.DiskPath(conflictRel)
 		if _, statErr := os.Stat(diskConflictPath); os.IsNotExist(statErr) {
 			if err := os.MkdirAll(filepath.Dir(diskConflictPath), 0755); err != nil {
-				return fmt.Errorf("mkdir sidecar: %w", err)
+				return "", fmt.Errorf("mkdir sidecar: %w", err)
 			}
 			f, err := os.Create(diskConflictPath)
 			if err != nil {
-				return fmt.Errorf("create sidecar: %w", err)
+				return "", fmt.Errorf("create sidecar: %w", err)
 			}
 			if dlErr := adapter.Get(context.Background(), ce.Path, f); dlErr != nil {
 				f.Close()
 				os.Remove(diskConflictPath)
-				return fmt.Errorf("download sidecar: %w", dlErr)
+				return "", fmt.Errorf("download sidecar: %w", dlErr)
 			}
 			f.Close()
 			entry, err := cl.DB().GetFile(ce.Path)
 			if err != nil {
-				return fmt.Errorf("get file: %w", err)
+				return "", fmt.Errorf("get file: %w", err)
 			}
 			mode := uint32(0100644)
 			if entry != nil {
@@ -265,11 +309,15 @@ func applyResolution(cl *cache.CacheLayer, adapter interface {
 		}
 		// Keep local dirty so it gets uploaded; clear the conflict state.
 		if err := cl.DB().SetState(ce.Path, cache.StateDirty); err != nil {
-			return fmt.Errorf("set dirty: %w", err)
+			return "", fmt.Errorf("set dirty: %w", err)
 		}
+		if err := cl.DB().RemoveConflict(ce.ID); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("kept both versions; remote copy saved as %s.conflict.%d", ce.Path, ce.RemoteMtime), nil
 	}
 
-	return cl.DB().RemoveConflict(ce.ID)
+	return "", nil
 }
 
 // buildAdapter creates a gdrive remote adapter for the given remote name.
@@ -304,6 +352,7 @@ func parseSource(source string) (remoteName, subPath string, err error) {
 
 func init() {
 	conflictsCmd.Flags().StringVar(&conflictsCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
+	conflictsCmd.Flags().BoolVar(&conflictsJSON, "json", false, "Output machine-readable JSON")
 
 	resolveCmd.Flags().StringVar(&resolveKeep, "keep", "", "Resolution strategy: local, remote, or both (required)")
 	resolveCmd.Flags().BoolVar(&resolveAll, "all", false, "Resolve all conflicts")

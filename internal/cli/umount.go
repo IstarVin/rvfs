@@ -14,6 +14,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+type drainResult struct {
+	Waited         bool
+	Aborted        bool
+	InitialPending int
+	FinalPending   int
+	Source         string
+}
+
 var umountCmd = &cobra.Command{
 	Use:   "umount <mountpoint>",
 	Short: "Unmount a FUSE filesystem",
@@ -27,41 +35,43 @@ unmounting. Press Ctrl-C to abort the wait and unmount immediately.
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mountpoint := args[0]
 		absMountpoint, _ := filepath.Abs(mountpoint)
+		summary := drainResult{}
 
 		reg, regErr := ipc.OpenMountRegistry()
 		if regErr == nil {
 			defer reg.Close()
 			entry, alive, _ := reg.Lookup(absMountpoint)
 			if alive {
-				drainPending(cmd, entry)
+				summary = drainPending(cmd, entry)
 			} else {
-				fmt.Fprintf(cmd.ErrOrStderr(),
-					"Warning: check `rvfs queue` first to ensure all uploads are complete.\n")
+				printWarning(cmd.ErrOrStderr(), "check 'rvfs queue' first to ensure all uploads are complete")
 			}
 		} else {
-			fmt.Fprintf(cmd.ErrOrStderr(),
-				"Warning: check `rvfs queue` first to ensure all uploads are complete.\n")
+			printWarning(cmd.ErrOrStderr(), "check 'rvfs queue' first to ensure all uploads are complete")
 		}
 
-		return unmount(mountpoint)
+		return unmount(cmd, mountpoint, summary)
 	},
 }
 
 // drainPending connects to the running mount, shows pending op count, and
 // blocks until all uploads finish or the user presses Ctrl-C.
-func drainPending(cmd *cobra.Command, entry ipc.MountEntry) {
+func drainPending(cmd *cobra.Command, entry ipc.MountEntry) drainResult {
+	result := drainResult{Source: entry.Source}
 	c, err := ipc.Dial(entry.SockPath)
 	if err != nil {
-		return
+		return result
 	}
 	defer c.Close()
 
 	resp, err := c.Status()
 	if err != nil || resp.Pending == 0 {
-		return
+		return result
 	}
+	result.Waited = true
+	result.InitialPending = resp.Pending
 
-	fmt.Fprintf(cmd.OutOrStdout(),
+	fprintf(cmd.OutOrStdout(),
 		"%s has %d pending upload(s). Waiting for drain... (Ctrl-C to abort)\n",
 		entry.Source, resp.Pending)
 
@@ -74,28 +84,33 @@ func drainPending(cmd *cobra.Command, entry ipc.MountEntry) {
 		select {
 		case <-ctx.Done():
 			if resp2, err2 := c.Status(); err2 == nil {
-				fmt.Fprintf(cmd.OutOrStdout(),
+				result.Aborted = true
+				result.FinalPending = resp2.Pending
+				fprintf(cmd.OutOrStdout(),
 					"\nAborted. Unmounting with %d pending op(s) remaining.\n", resp2.Pending)
 			} else {
-				fmt.Fprintln(cmd.OutOrStdout(), "\nAborted.")
+				result.Aborted = true
+				fprintln(cmd.OutOrStdout(), "\nAborted.")
 			}
-			return
+			return result
 		case <-ticker.C:
 			resp2, err2 := c.Status()
 			if err2 != nil {
-				return
+				return result
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "\r%d pending upload(s) remaining...  ", resp2.Pending)
+			fprintf(cmd.OutOrStdout(), "\r%d pending upload(s) remaining...  ", resp2.Pending)
 			if resp2.Pending == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "\nAll uploads complete.")
-				return
+				result.FinalPending = 0
+				fprintln(cmd.OutOrStdout(), "\nAll uploads complete.")
+				return result
 			}
 			resp = resp2
+			result.FinalPending = resp2.Pending
 		}
 	}
 }
 
-func unmount(mountpoint string) error {
+func unmount(cmd *cobra.Command, mountpoint string, summary drainResult) error {
 	var out []byte
 	var err error
 
@@ -115,6 +130,16 @@ func unmount(mountpoint string) error {
 	if err != nil {
 		return fmt.Errorf("umount %s: %w\n%s", mountpoint, err, out)
 	}
-	fmt.Printf("Unmounted %s\n", mountpoint)
+	printSuccess(cmd.OutOrStdout(), "unmounted %s", mountpoint)
+	if summary.Waited {
+		state := fmt.Sprintf("started with %d pending upload(s)", summary.InitialPending)
+		if summary.Aborted {
+			state = fmt.Sprintf("aborted with %d pending upload(s) remaining", summary.FinalPending)
+		} else {
+			state = "uploads drained before unmount"
+		}
+		printKeyValues(cmd.OutOrStdout(), [][2]string{{"Drain:", state}})
+	}
+	fprintln(cmd.OutOrStdout())
 	return nil
 }

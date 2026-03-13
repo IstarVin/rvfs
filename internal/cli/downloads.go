@@ -4,9 +4,10 @@ import (
 	"fmt"
 
 	"github.com/IstarVin/rvfs/internal/ipc"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
+
+var downloadsJSON bool
 
 var downloadsCmd = &cobra.Command{
 	Use:   "downloads <source> [path]",
@@ -38,18 +39,32 @@ var downloadsCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if downloadsJSON {
+			return writeJSON(cmd.OutOrStdout(), resp)
+		}
 		if len(resp.Entries) == 0 {
 			fmt.Fprintln(cmd.OutOrStdout(), "No matching downloads.")
 			return nil
 		}
 
-		hdr := lipgloss.NewStyle().Bold(true).Underline(true)
-		fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n",
-			hdr.Width(40).Render("PATH"),
-			hdr.Width(12).Render("STATE"),
-			hdr.Width(18).Render("PROGRESS"),
-			hdr.Render("BYTES"),
-		)
+		active := 0
+		failed := 0
+		completed := 0
+		for _, e := range resp.Entries {
+			switch {
+			case e.Err != "":
+				failed++
+			case e.Done:
+				completed++
+			default:
+				active++
+			}
+		}
+
+		printSection(cmd.OutOrStdout(), fmt.Sprintf("Downloads for %s", args[0]))
+		fprintf(cmd.OutOrStdout(), "%d tracked, %d active, %d complete, %d with errors\n", len(resp.Entries), active, completed, failed)
+
+		rows := make([][]string, 0, len(resp.Entries))
 		for _, e := range resp.Entries {
 			progress := "-"
 			if e.TotalSize > 0 {
@@ -64,15 +79,31 @@ var downloadsCmd = &cobra.Command{
 			}
 			bytes := fmt.Sprintf("%s / %s", humanBytes(e.Downloaded), humanBytes(e.TotalSize))
 			if e.Done {
-				progress = "done"
+				progress = okStyle.Render("done")
 			}
+			state := e.State
 			if e.Err != "" {
-				progress = "error"
-				bytes = e.Err
+				progress = errorStyle.Render("error")
+				state = warnStyle.Render(e.State)
+				bytes = ellipsize(e.Err, 38)
 			}
-
-			fmt.Fprintf(cmd.OutOrStdout(), "%-40s  %-12s  %-18s  %s\n", e.Path, e.State, progress, bytes)
+			rows = append(rows, []string{e.Path, state, progress, bytes})
 		}
+
+		renderTable(cmd.OutOrStdout(), []tableColumn{
+			{Title: "PATH", Width: 40},
+			{Title: "STATE", Width: 14},
+			{Title: "PROGRESS", Width: 12},
+			{Title: "DETAIL", Width: 38},
+		}, rows)
+		if failed > 0 {
+			printHint(cmd.OutOrStdout(), "retry the affected path by reopening it or remounting if the errors persist")
+		}
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
+}
+
+func init() {
+	downloadsCmd.Flags().BoolVar(&downloadsJSON, "json", false, "Output machine-readable JSON")
 }

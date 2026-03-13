@@ -11,6 +11,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var remoteListJSON bool
+
+type remoteListEntry struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Root string `json:"root"`
+}
+
 var remoteCmd = &cobra.Command{
 	Use:   "remote",
 	Short: "Manage remote storage backends",
@@ -39,23 +47,23 @@ var remoteAddCmd = &cobra.Command{
 			return fmt.Errorf("remote %q already exists", remoteName)
 		}
 
-		reader := bufio.NewReader(os.Stdin)
+		reader := bufio.NewReader(cmd.InOrStdin())
 
-		fmt.Print("Client ID: ")
+		fprintf(cmd.OutOrStdout(), "Client ID: ")
 		clientID, _ := reader.ReadString('\n')
 		clientID = strings.TrimSpace(clientID)
 		if clientID == "" {
 			return fmt.Errorf("client ID is required")
 		}
 
-		fmt.Print("Client Secret: ")
+		fprintf(cmd.OutOrStdout(), "Client Secret: ")
 		clientSecret, _ := reader.ReadString('\n')
 		clientSecret = strings.TrimSpace(clientSecret)
 		if clientSecret == "" {
 			return fmt.Errorf("client secret is required")
 		}
 
-		fmt.Print("Root path (leave empty for entire Drive): ")
+		fprintf(cmd.OutOrStdout(), "Root path (leave empty for entire Drive): ")
 		rootPath, _ := reader.ReadString('\n')
 		rootPath = strings.TrimSpace(rootPath)
 
@@ -73,12 +81,17 @@ var remoteAddCmd = &cobra.Command{
 
 		// Run OAuth2 flow.
 		tokenPath := config.TokenPath(remoteName)
-		fmt.Println()
+		fprintln(cmd.OutOrStdout())
+		printSection(cmd.OutOrStdout(), fmt.Sprintf("Authorizing %s", remoteName))
+		printHint(cmd.OutOrStdout(), "complete the browser-based Google Drive flow and return here")
 		if err := gdrive.Authenticate(clientID, clientSecret, tokenPath); err != nil {
 			return fmt.Errorf("authentication failed: %w", err)
 		}
 
-		fmt.Fprintf(os.Stderr, "\nRemote %q added successfully.\n", remoteName)
+		printSuccess(cmd.OutOrStdout(), "remote %q added", remoteName)
+		printKeyValues(cmd.OutOrStdout(), [][2]string{{"Type:", remoteType}, {"Root:", defaultRemoteRoot(rootPath)}, {"Token:", tokenPath}})
+		printHint(cmd.OutOrStdout(), "mount it with 'rvfs mount %s: <mountpoint>'", remoteName)
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }
@@ -106,7 +119,9 @@ var remoteAuthCmd = &cobra.Command{
 			return fmt.Errorf("authentication failed: %w", err)
 		}
 
-		fmt.Fprintf(os.Stderr, "Remote %q re-authenticated.\n", remoteName)
+		printSuccess(cmd.OutOrStdout(), "remote %q re-authenticated", remoteName)
+		printKeyValues(cmd.OutOrStdout(), [][2]string{{"Token:", tokenPath}})
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }
@@ -122,17 +137,33 @@ var remoteListCmd = &cobra.Command{
 		}
 
 		if len(cfg.Remotes) == 0 {
-			fmt.Println("No remotes configured. Use 'rvfs remote add' to add one.")
+			fprintln(cmd.OutOrStdout(), "No remotes configured. Use 'rvfs remote add' to add one.")
 			return nil
 		}
 
-		for name, rc := range cfg.Remotes {
+		remoteNames := make(map[string]struct{}, len(cfg.Remotes))
+		for name := range cfg.Remotes {
+			remoteNames[name] = struct{}{}
+		}
+		names := sortedRemoteNames(remoteNames)
+
+		rows := make([][]string, 0, len(names))
+		items := make([]remoteListEntry, 0, len(names))
+		for _, name := range names {
+			rc := cfg.Remotes[name]
 			root := rc.RootPath
 			if root == "" {
 				root = "/"
 			}
-			fmt.Printf("%-20s type=%-8s root=%s\n", name, rc.Type, root)
+			items = append(items, remoteListEntry{Name: name, Type: rc.Type, Root: root})
+			rows = append(rows, []string{name, rc.Type, root})
 		}
+		if remoteListJSON {
+			return writeJSON(cmd.OutOrStdout(), items)
+		}
+		printSection(cmd.OutOrStdout(), "Configured remotes")
+		renderTable(cmd.OutOrStdout(), []tableColumn{{Title: "NAME", Width: 22}, {Title: "TYPE", Width: 10}, {Title: "ROOT", Width: 36}}, rows)
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }
@@ -163,11 +194,21 @@ var remoteRemoveCmd = &cobra.Command{
 		tokenPath := config.TokenPath(remoteName)
 		os.Remove(tokenPath)
 
-		fmt.Fprintf(os.Stderr, "Remote %q removed.\n", remoteName)
+		printSuccess(cmd.OutOrStdout(), "remote %q removed", remoteName)
+		printKeyValues(cmd.OutOrStdout(), [][2]string{{"Token removed:", tokenPath}})
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }
 
+func defaultRemoteRoot(root string) string {
+	if root == "" {
+		return "/"
+	}
+	return root
+}
+
 func init() {
+	remoteListCmd.Flags().BoolVar(&remoteListJSON, "json", false, "Output machine-readable JSON")
 	remoteCmd.AddCommand(remoteAddCmd, remoteAuthCmd, remoteListCmd, remoteRemoveCmd)
 }

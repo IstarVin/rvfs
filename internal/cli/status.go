@@ -2,13 +2,16 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/IstarVin/rvfs/internal/ipc"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
+
+var statusJSON bool
 
 var statusCmd = &cobra.Command{
 	Use:   "status [source]",
@@ -21,13 +24,13 @@ If no source is given, all active mounts are queried.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {
-			return showStatus(args[0])
+			return showStatus(cmd, args[0])
 		}
-		return showAllStatus()
+		return showAllStatus(cmd)
 	},
 }
 
-func showStatus(source string) error {
+func showStatus(cmd *cobra.Command, source string) error {
 	remoteID, sockPath, cl, err := resolveSource(source)
 	if err != nil {
 		return err
@@ -39,7 +42,10 @@ func showStatus(source string) error {
 		defer c.Close()
 		resp, statusErr := c.Status()
 		if statusErr == nil {
-			printStatus(resp)
+			if statusJSON {
+				return writeJSON(cmd.OutOrStdout(), resp)
+			}
+			printStatus(cmd.OutOrStdout(), resp, true)
 			return nil
 		}
 	}
@@ -47,7 +53,7 @@ func showStatus(source string) error {
 	// Fallback: read directly from the SQLite DB (mount not running).
 	pending, _ := cl.DB().CountPendingOps()
 	conflicts, _ := cl.DB().CountConflicts()
-	printStatus(ipc.StatusResponse{
+	resp := ipc.StatusResponse{
 		Source:     source,
 		Mountpoint: "(not mounted)",
 		Online:     false,
@@ -55,23 +61,77 @@ func showStatus(source string) error {
 		CacheTotal: 0,
 		Pending:    pending,
 		Conflicts:  conflicts,
-	})
+	}
+	if statusJSON {
+		return writeJSON(cmd.OutOrStdout(), resp)
+	}
+	printStatus(cmd.OutOrStdout(), resp, true)
 	_ = remoteID
 	return nil
 }
 
-func showAllStatus() error {
-	_ = getCacheDir()
-
-	// Enumerate *.sock files to find active mounts.
-	sockDir := ipc.SockDir()
-
-	ents, err := os.ReadDir(sockDir)
-	if err != nil || len(ents) == 0 {
-		fmt.Println("No active mounts found.")
+func showAllStatus(cmd *cobra.Command) error {
+	responses, err := collectAllStatus()
+	if err != nil {
+		return err
+	}
+	if len(responses) == 0 {
+		fprintln(cmd.OutOrStdout(), "No active mounts found.")
 		return nil
 	}
-	found := false
+	if statusJSON {
+		return writeJSON(cmd.OutOrStdout(), responses)
+	}
+	for i, resp := range responses {
+		printStatus(cmd.OutOrStdout(), resp, true)
+		if i < len(responses)-1 {
+			fprintln(cmd.OutOrStdout())
+		}
+	}
+	return nil
+}
+
+func collectAllStatus() ([]ipc.StatusResponse, error) {
+	_ = getCacheDir()
+
+	reg, regErr := ipc.OpenMountRegistry()
+	if regErr == nil {
+		defer reg.Close()
+		entries, err := reg.ListAll()
+		if err == nil && len(entries) > 0 {
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].Source == entries[j].Source {
+					return entries[i].Mountpoint < entries[j].Mountpoint
+				}
+				return entries[i].Source < entries[j].Source
+			})
+
+			responses := make([]ipc.StatusResponse, 0, len(entries))
+			for _, entry := range entries {
+				c, dialErr := ipc.Dial(entry.SockPath)
+				if dialErr != nil {
+					continue
+				}
+				resp, statusErr := c.Status()
+				c.Close()
+				if statusErr != nil {
+					continue
+				}
+				responses = append(responses, resp)
+			}
+			if len(responses) > 0 {
+				return responses, nil
+			}
+		}
+	}
+
+	sockDir := ipc.SockDir()
+	ents, err := os.ReadDir(sockDir)
+	if err != nil || len(ents) == 0 {
+		return nil, nil
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name() < ents[j].Name() })
+	responses := make([]ipc.StatusResponse, 0, len(ents))
 	for _, ent := range ents {
 		if ent.IsDir() || filepath.Ext(ent.Name()) != ".sock" {
 			continue
@@ -86,28 +146,13 @@ func showAllStatus() error {
 		if statusErr != nil {
 			continue
 		}
-		printStatus(resp)
-		found = true
+		responses = append(responses, resp)
 	}
-	if !found {
-		fmt.Println("No active mounts found.")
-	}
-	return nil
+	return responses, nil
 }
 
-// Lipgloss styles.
-var (
-	labelStyle = lipgloss.NewStyle().Bold(true).Width(11)
-	valueStyle = lipgloss.NewStyle()
-	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
-)
-
-func printStatus(r ipc.StatusResponse) {
-	onlineStr := okStyle.Render("ONLINE")
-	if !r.Online {
-		onlineStr = warnStyle.Render("OFFLINE")
-	}
+func printStatus(w io.Writer, r ipc.StatusResponse, showHints bool) {
+	onlineStr := statusBadge(r.Online, "ONLINE", "OFFLINE")
 
 	cacheStr := "—"
 	if r.CacheMinFreeSpace > 0 && r.CacheFSFree > 0 {
@@ -132,38 +177,39 @@ func printStatus(r ipc.StatusResponse) {
 		cacheStr = humanBytes(r.CacheUsed)
 	}
 
+	pendingLabel := fmt.Sprintf("%d %s waiting", r.Pending, pluralize(r.Pending, "upload", "uploads"))
+	if r.Pending == 0 {
+		pendingLabel = okStyle.Render("Up to date")
+	}
+	conflictLabel := fmt.Sprintf("%d unresolved", r.Conflicts)
+	if r.Conflicts == 0 {
+		conflictLabel = okStyle.Render("None")
+	}
+
+	printSection(w, r.Source)
 	rows := [][2]string{
 		{"Mount:", r.Mountpoint},
 		{"Remote:", r.Source},
 		{"State:", onlineStr},
 		{"Cache:", cacheStr},
-		{"Pending:", fmt.Sprintf("%d files to upload", r.Pending)},
-		{"Conflicts:", fmt.Sprintf("%d unresolved", r.Conflicts)},
+		{"Pending:", pendingLabel},
+		{"Conflicts:", conflictLabel},
 	}
-	for _, row := range rows {
-		fmt.Printf("%s %s\n", labelStyle.Render(row[0]), valueStyle.Render(row[1]))
+	printKeyValues(w, rows)
+	if showHints {
+		switch {
+		case !r.Online && r.Mountpoint != "(not mounted)":
+			printHint(w, "cached files remain available; sync will resume when connectivity returns")
+		case r.Pending > 0:
+			printHint(w, "run 'rvfs queue %s' to inspect pending operations", r.Source)
+		}
+		if r.Conflicts > 0 {
+			printHint(w, "run 'rvfs conflicts %s' to review and resolve conflicts", r.Source)
+		}
 	}
-	fmt.Println()
+	fprintln(w)
 }
 
-func humanBytes(b int64) string {
-	const (
-		_  = iota
-		KB = 1 << (10 * iota)
-		MB
-		GB
-		TB
-	)
-	switch {
-	case b >= TB:
-		return fmt.Sprintf("%.1f TB", float64(b)/float64(TB))
-	case b >= GB:
-		return fmt.Sprintf("%.1f GB", float64(b)/float64(GB))
-	case b >= MB:
-		return fmt.Sprintf("%.1f MB", float64(b)/float64(MB))
-	case b >= KB:
-		return fmt.Sprintf("%.1f KB", float64(b)/float64(KB))
-	default:
-		return fmt.Sprintf("%d B", b)
-	}
+func init() {
+	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output machine-readable JSON")
 }

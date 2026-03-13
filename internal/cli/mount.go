@@ -170,13 +170,16 @@ For a configured remote:
 			fatalMsg, warnings := readDaemonStartup(statusR)
 			statusR.Close()
 			for _, w := range warnings {
-				fmt.Fprintln(os.Stderr, "warning:", w)
+				printWarning(cmd.ErrOrStderr(), "%s", w)
 			}
 			if fatalMsg != "" {
 				_ = daemonCmd.Process.Kill()
 				return fmt.Errorf("%s", fatalMsg)
 			}
-			fmt.Fprintf(os.Stdout, "rvfs daemon started (pid %d)\n", daemonCmd.Process.Pid)
+			printSection(cmd.OutOrStdout(), "Mount ready")
+			printKeyValues(cmd.OutOrStdout(), [][2]string{{"Source:", source}, {"Mount:", absMountpoint}, {"PID:", fmt.Sprintf("%d", daemonCmd.Process.Pid)}})
+			printHint(cmd.OutOrStdout(), "run 'rvfs status %s' to inspect mount health", source)
+			fprintln(cmd.OutOrStdout())
 			return nil
 		}
 

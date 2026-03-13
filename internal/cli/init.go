@@ -22,7 +22,9 @@ If the file already exists the command exits without modifying it unless --force
 
 		if !initForce {
 			if _, err := os.Stat(cfgPath); err == nil {
-				fmt.Fprintf(cmd.OutOrStdout(), "Config already exists at %s (use --force to overwrite)\n", cfgPath)
+				printWarning(cmd.OutOrStdout(), "config already exists at %s", cfgPath)
+				printHint(cmd.OutOrStdout(), "rerun with '--force' to overwrite it")
+				fprintln(cmd.OutOrStdout())
 				return nil
 			}
 		}
@@ -37,7 +39,10 @@ If the file already exists the command exits without modifying it unless --force
 			return fmt.Errorf("write config: %w", err)
 		}
 
-		fmt.Fprintf(cmd.OutOrStdout(), "Initialised rvfs config at %s\n", cfgPath)
+		printSuccess(cmd.OutOrStdout(), "initialized rvfs configuration")
+		printKeyValues(cmd.OutOrStdout(), [][2]string{{"Config:", cfgPath}})
+		printHint(cmd.OutOrStdout(), "next: run 'rvfs remote add gdrive <name>' to configure a remote")
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }

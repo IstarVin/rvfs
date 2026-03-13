@@ -25,11 +25,14 @@ var syncCmd = &cobra.Command{
 		defer cl.Close()
 		_ = remoteID
 
+		pending, _ := cl.DB().CountPendingOps()
+		conflicts, _ := cl.DB().CountConflicts()
+
 		if syncForce {
 			if resetErr := cl.DB().ResetRetryAfter(); resetErr != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: reset retry timers: %v\n", resetErr)
+				printWarning(cmd.ErrOrStderr(), "could not clear retry timers: %v", resetErr)
 			} else {
-				fmt.Fprintln(cmd.OutOrStdout(), "Retry timers cleared.")
+				printSuccess(cmd.OutOrStdout(), "retry timers cleared")
 			}
 		}
 
@@ -42,7 +45,18 @@ var syncCmd = &cobra.Command{
 		if err := c.Sync(syncForce); err != nil {
 			return err
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Sync triggered.")
+		printSection(cmd.OutOrStdout(), fmt.Sprintf("Sync requested for %s", args[0]))
+		printKeyValues(cmd.OutOrStdout(), [][2]string{
+			{"Pending:", fmt.Sprintf("%d %s", pending, pluralize(pending, "operation", "operations"))},
+			{"Conflicts:", fmt.Sprintf("%d unresolved", conflicts)},
+		})
+		if pending > 0 {
+			printHint(cmd.OutOrStdout(), "run 'rvfs queue %s' if uploads remain stuck after a few seconds", args[0])
+		}
+		if conflicts > 0 {
+			printHint(cmd.OutOrStdout(), "run 'rvfs conflicts %s' to inspect unresolved conflicts", args[0])
+		}
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }

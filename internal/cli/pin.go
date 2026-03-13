@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var pinsTree bool
+var (
+	pinsTree bool
+	pinsJSON bool
+)
 
 var pinCmd = &cobra.Command{
 	Use:   "pin (<source> <path> | <mount-path>)",
@@ -66,15 +70,24 @@ var pinCmd = &cobra.Command{
 				} else {
 					prefetchStatus = fmt.Sprintf("prefetch started for %d/%d file(s)", started, len(filePaths))
 				}
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but prefetch failed for %d file(s): %s\n", len(failed), strings.Join(failed, "; "))
+				printWarning(cmd.ErrOrStderr(), "pinned, but prefetch failed for %d file(s): %s", len(failed), strings.Join(failed, "; "))
 			}
 		} else {
 			if len(filePaths) > 0 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but mount is not reachable; cache prefetch not started\n")
+				printWarning(cmd.ErrOrStderr(), "pinned, but the mount is not reachable; cache prefetch did not start")
 			}
 		}
 
-		fmt.Printf("Pinned: %s (%d path(s), %s)\n", rel, len(pinPaths), prefetchStatus)
+		printSection(cmd.OutOrStdout(), "Pinned")
+		printKeyValues(cmd.OutOrStdout(), [][2]string{
+			{"Path:", rel},
+			{"Pinned:", fmt.Sprintf("%d %s", len(pinPaths), pluralize(len(pinPaths), "path", "paths"))},
+			{"Fetch:", prefetchStatus},
+		})
+		if targetIsDir {
+			printHint(cmd.OutOrStdout(), "directory prefetch is queued sequentially to avoid flooding the downloader")
+		}
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }
@@ -118,15 +131,21 @@ var unpinCmd = &cobra.Command{
 				evictStatus = fmt.Sprintf("cache evicted for %d file(s)", evicted)
 			default:
 				evictStatus = fmt.Sprintf("cache evicted for %d/%d file(s)", evicted, len(filePaths))
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but cache eviction failed for %d file(s): %s\n", len(failed), strings.Join(failed, "; "))
+				printWarning(cmd.ErrOrStderr(), "unpinned, but cache eviction failed for %d file(s): %s", len(failed), strings.Join(failed, "; "))
 			}
 		} else {
 			if len(filePaths) > 0 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but mount is not reachable; immediate cache eviction skipped\n")
+				printWarning(cmd.ErrOrStderr(), "unpinned, but the mount is not reachable; immediate cache eviction was skipped")
 			}
 		}
 
-		fmt.Printf("Unpinned: %s (%d path(s), %s)\n", rel, len(pinPaths), evictStatus)
+		printSection(cmd.OutOrStdout(), "Unpinned")
+		printKeyValues(cmd.OutOrStdout(), [][2]string{
+			{"Path:", rel},
+			{"Unpinned:", fmt.Sprintf("%d %s", len(pinPaths), pluralize(len(pinPaths), "path", "paths"))},
+			{"Cache:", evictStatus},
+		})
+		fprintln(cmd.OutOrStdout())
 		return nil
 	},
 }
@@ -183,40 +202,40 @@ var pinsCmd = &cobra.Command{
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
-			return listAllPins()
+			return listAllPins(cmd.OutOrStdout())
 		}
 		if filepath.IsAbs(args[0]) {
-			return listPinsByMount(args[0])
+			return listPinsByMount(cmd.OutOrStdout(), args[0])
 		}
-		return listPins(args[0])
+		return listPins(cmd.OutOrStdout(), args[0])
 	},
 }
 
-func listPinsByMount(path string) error {
+func listPinsByMount(w io.Writer, path string) error {
 	_, _, cl, _, err := resolveMountPath(path)
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
-	return printPins(cl)
+	return printPins(w, cl)
 }
 
-func listPins(source string) error {
+func listPins(w io.Writer, source string) error {
 	_, _, cl, err := resolveSource(source)
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
-	return printPins(cl)
+	return printPins(w, cl)
 }
 
-func printPins(cl *cache.CacheLayer) error {
+func printPins(w io.Writer, cl *cache.CacheLayer) error {
 	pins, err := cl.DB().ListPinned()
 	if err != nil {
 		return fmt.Errorf("list pinned: %w", err)
 	}
 	if len(pins) == 0 {
-		fmt.Println("No pinned paths.")
+		fprintln(w, "No pinned paths.")
 		return nil
 	}
 
@@ -224,21 +243,28 @@ func printPins(cl *cache.CacheLayer) error {
 	if err != nil {
 		return err
 	}
+	if pinsJSON {
+		return writeJSON(w, out)
+	}
 
 	if pinsTree {
 		expanded, err := expandForTree(cl.DB(), out)
 		if err != nil {
 			return err
 		}
+		printSection(w, "Pinned paths")
 		for _, line := range renderPinsTree(expanded) {
-			fmt.Println(line)
+			fprintln(w, line)
 		}
+		fprintln(w)
 		return nil
 	}
 
+	printSection(w, "Pinned paths")
 	for _, e := range out {
-		fmt.Println(formatPinnedPath(e))
+		fprintln(w, formatPinnedPath(e))
 	}
+	fprintln(w)
 	return nil
 }
 
@@ -446,24 +472,24 @@ func renderPinsTree(entries []pinnedOutput) []string {
 	return lines
 }
 
-func listAllPins() error {
+func listAllPins(w io.Writer) error {
 	cacheDir := getCacheDir()
 	// Walk one level deep: each subdirectory is a remoteID.
 	entries, err := filepath.Glob(filepath.Join(cacheDir, "*", "meta.db"))
 	if err != nil || len(entries) == 0 {
-		fmt.Println("No remotes found in cache directory.")
+		fprintln(w, "No remotes found in cache directory.")
 		return nil
 	}
 	sort.Strings(entries)
 	for i, dbPath := range entries {
 		remoteID := filepath.Base(filepath.Dir(dbPath))
 		source := remoteID + ":"
-		fmt.Printf("%s\n", source)
-		if err := listPins(source); err != nil {
-			fmt.Printf("  (error reading %s: %v)\n", remoteID, err)
+		fprintln(w, source)
+		if err := listPins(w, source); err != nil {
+			fprintf(w, "  (error reading %s: %v)\n", remoteID, err)
 		}
 		if i < len(entries)-1 {
-			fmt.Println()
+			fprintln(w)
 		}
 	}
 	return nil
@@ -471,4 +497,5 @@ func listAllPins() error {
 
 func init() {
 	pinsCmd.Flags().BoolVar(&pinsTree, "tree", false, "Show pinned paths as a tree")
+	pinsCmd.Flags().BoolVar(&pinsJSON, "json", false, "Output machine-readable JSON")
 }
