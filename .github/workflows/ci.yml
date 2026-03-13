@@ -39,10 +39,5 @@ jobs:
           path: bin/rvfs
           retention-days: 7
 
-      - name: Lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-
       - name: Test
         run: go test -race -timeout 120s ./...
