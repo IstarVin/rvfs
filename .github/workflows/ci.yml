@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  ci:
+    name: Build, Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install FUSE
+        run: sudo apt-get install -y fuse libfuse-dev
+
+      - name: Verify dependencies
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+
+      - name: Build
+        run: |
+          mkdir -p bin
+          go build -o bin/rvfs ./cmd/rvfs
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvfs-linux-amd64
+          path: bin/rvfs
+          retention-days: 7
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Test
+        run: go test -race -timeout 120s ./...
