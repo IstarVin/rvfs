@@ -43,6 +43,7 @@ func init() {
 	rootCmd.AddCommand(resolveCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(queueCmd)
+	rootCmd.AddCommand(downloadsCmd)
 	rootCmd.AddCommand(syncCmd)
 	rootCmd.AddCommand(umountCmd)
 	rootCmd.AddCommand(pinCmd)

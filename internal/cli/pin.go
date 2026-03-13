@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/ipc"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
@@ -15,16 +16,17 @@ var pinCmd = &cobra.Command{
 	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var cl *cache.CacheLayer
+		var sockPath string
 		var rel string
 		var err error
 
 		if len(args) == 1 {
-			_, _, cl, rel, err = resolveMountPath(args[0])
+			_, sockPath, cl, rel, err = resolveMountPath(args[0])
 			if err != nil {
 				return err
 			}
 		} else {
-			_, _, cl, err = resolveSource(args[0])
+			_, sockPath, cl, err = resolveSource(args[0])
 			if err != nil {
 				return err
 			}
@@ -35,7 +37,20 @@ var pinCmd = &cobra.Command{
 		if err := cl.DB().SetPinned(rel, true); err != nil {
 			return fmt.Errorf("pin %q: %w", rel, err)
 		}
-		fmt.Printf("Pinned: %s\n", rel)
+
+		prefetchStatus := "metadata-only"
+		if c, dialErr := ipc.Dial(sockPath); dialErr == nil {
+			defer c.Close()
+			if err := c.Prefetch(rel); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but prefetch failed for %s: %v\n", rel, err)
+			} else {
+				prefetchStatus = "prefetch started"
+			}
+		} else {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: pinned but mount is not reachable; cache prefetch not started\n")
+		}
+
+		fmt.Printf("Pinned: %s (%s)\n", rel, prefetchStatus)
 		return nil
 	},
 }
@@ -46,16 +61,17 @@ var unpinCmd = &cobra.Command{
 	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var cl *cache.CacheLayer
+		var sockPath string
 		var rel string
 		var err error
 
 		if len(args) == 1 {
-			_, _, cl, rel, err = resolveMountPath(args[0])
+			_, sockPath, cl, rel, err = resolveMountPath(args[0])
 			if err != nil {
 				return err
 			}
 		} else {
-			_, _, cl, err = resolveSource(args[0])
+			_, sockPath, cl, err = resolveSource(args[0])
 			if err != nil {
 				return err
 			}
@@ -66,7 +82,20 @@ var unpinCmd = &cobra.Command{
 		if err := cl.DB().SetPinned(rel, false); err != nil {
 			return fmt.Errorf("unpin %q: %w", rel, err)
 		}
-		fmt.Printf("Unpinned: %s\n", rel)
+
+		evictStatus := "metadata-only"
+		if c, dialErr := ipc.Dial(sockPath); dialErr == nil {
+			defer c.Close()
+			if err := c.Evict(rel); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but cache eviction failed for %s: %v\n", rel, err)
+			} else {
+				evictStatus = "cache evicted"
+			}
+		} else {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: unpinned but mount is not reachable; immediate cache eviction skipped\n")
+		}
+
+		fmt.Printf("Unpinned: %s (%s)\n", rel, evictStatus)
 		return nil
 	},
 }

@@ -7,10 +7,13 @@ package ipc
 
 // Request is sent by the client to the server.
 type Request struct {
-	// Cmd is the command name: "status" or "sync".
+	// Cmd is the command name: "status", "sync", "prefetch", "evict", or "downloads".
 	Cmd string `json:"cmd"`
 	// Force is used with Cmd=="sync" to clear all retry_after timers first.
 	Force bool `json:"force,omitempty"`
+	// Path is used with Cmd=="prefetch", "evict", or "downloads".
+	// For "downloads", an empty path means "list active downloads".
+	Path string `json:"path,omitempty"`
 }
 
 // StatusResponse is the server's reply to a "status" request.
@@ -39,6 +42,27 @@ type StatusResponse struct {
 type SyncResponse struct {
 	OK  bool   `json:"ok"`
 	Err string `json:"err,omitempty"`
+}
+
+// ActionResponse is the server's reply to a command that mutates state.
+type ActionResponse struct {
+	OK  bool   `json:"ok"`
+	Err string `json:"err,omitempty"`
+}
+
+// DownloadStatusEntry describes one path's download/cache status.
+type DownloadStatusEntry struct {
+	Path       string `json:"path"`
+	State      string `json:"state"`
+	Downloaded int64  `json:"downloaded"`
+	TotalSize  int64  `json:"total_size"`
+	Done       bool   `json:"done"`
+	Err        string `json:"err,omitempty"`
+}
+
+// DownloadStatusResponse is the server's reply to a "downloads" request.
+type DownloadStatusResponse struct {
+	Entries []DownloadStatusEntry `json:"entries"`
 }
 
 // SockPath returns the UNIX socket path for a given remoteID.

@@ -216,6 +216,38 @@ func TestEvictEntry_AlreadyDeleted(t *testing.T) {
 	assert.Equal(t, StateEvicted, entry.State)
 }
 
+func TestEvictPath_HappyPath(t *testing.T) {
+	t.Parallel()
+	cl := newTestCache(t)
+
+	seedCleanFile(t, cl, "a.txt", 123, time.Now().Unix())
+
+	require.NoError(t, EvictPath(cl, "a.txt"))
+
+	_, err := os.Stat(cl.diskPath("a.txt"))
+	assert.True(t, os.IsNotExist(err))
+
+	e, err := cl.db.GetFile("a.txt")
+	require.NoError(t, err)
+	assert.Equal(t, StateEvicted, e.State)
+}
+
+func TestEvictPath_Directory(t *testing.T) {
+	t.Parallel()
+	cl := newTestCache(t)
+
+	require.NoError(t, cl.db.PutFile(&FileEntry{
+		Path:  "folder",
+		IsDir: true,
+		Mode:  040755,
+		State: StateClean,
+	}))
+
+	err := EvictPath(cl, "folder")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "directory")
+}
+
 // ---------- Evictor.Run ----------
 
 func TestEvictorRun_ContextCancel(t *testing.T) {

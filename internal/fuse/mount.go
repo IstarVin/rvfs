@@ -42,6 +42,9 @@ type MountOptions struct {
 	// VerifyChecksums, when true, re-hashes clean cache files on Open and
 	// evicts them if the checksum does not match the stored value.
 	VerifyChecksums bool
+	// DownloadManager allows callers to inject a shared download manager.
+	// When nil and Adapter is non-nil, Mount creates a manager automatically.
+	DownloadManager *download.Manager
 }
 
 // Mount creates a CacheLayer for the given remote-id, mounts it at mountpoint,
@@ -60,8 +63,10 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 
 	rootState := &RootState{cache: cl}
 
-	// If a remote adapter is provided, create a Download Manager.
-	if opts.Adapter != nil {
+	if opts.DownloadManager != nil {
+		rootState.downloadMgr = opts.DownloadManager
+	} else if opts.Adapter != nil {
+		// If a remote adapter is provided, create a Download Manager.
 		rootState.downloadMgr = download.NewManager(opts.Adapter, cl, opts.Monitor, download.ManagerOptions{
 			ReadAhead:   opts.ReadAhead,
 			IdleTimeout: opts.IdleTimeout,

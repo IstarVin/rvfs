@@ -16,11 +16,16 @@ import (
 
 // mockHandler is a test double for the Handler interface.
 type mockHandler struct {
-	mu           sync.Mutex
-	statusResp   StatusResponse
-	statusErr    error
-	syncErr      error
+	mu            sync.Mutex
+	statusResp    StatusResponse
+	statusErr     error
+	syncErr       error
 	syncForceSeen bool
+	prefetchErr   error
+	evictErr      error
+	downloadsResp DownloadStatusResponse
+	downloadsErr  error
+	lastPath      string
 }
 
 func (m *mockHandler) HandleStatus() (StatusResponse, error) {
@@ -34,6 +39,27 @@ func (m *mockHandler) HandleSync(force bool) error {
 	defer m.mu.Unlock()
 	m.syncForceSeen = force
 	return m.syncErr
+}
+
+func (m *mockHandler) HandlePrefetch(path string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastPath = path
+	return m.prefetchErr
+}
+
+func (m *mockHandler) HandleEvict(path string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastPath = path
+	return m.evictErr
+}
+
+func (m *mockHandler) HandleDownloads(path string) (DownloadStatusResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastPath = path
+	return m.downloadsResp, m.downloadsErr
 }
 
 // startTestServer starts a Server with the given handler, registers cleanup,
@@ -131,6 +157,87 @@ func TestServerSyncError(t *testing.T) {
 	err = c.Sync(false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote unreachable")
+}
+
+func TestServerPrefetchHappyPath(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	require.NoError(t, c.Prefetch("docs/a.txt"))
+	h.mu.Lock()
+	assert.Equal(t, "docs/a.txt", h.lastPath)
+	h.mu.Unlock()
+}
+
+func TestServerPrefetchError(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{prefetchErr: errors.New("not found")}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	err = c.Prefetch("docs/missing.txt")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestServerEvictHappyPath(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	require.NoError(t, c.Evict("docs/a.txt"))
+	h.mu.Lock()
+	assert.Equal(t, "docs/a.txt", h.lastPath)
+	h.mu.Unlock()
+}
+
+func TestServerDownloadsHappyPath(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{downloadsResp: DownloadStatusResponse{Entries: []DownloadStatusEntry{{
+		Path:       "docs/a.txt",
+		State:      "downloading",
+		Downloaded: 5,
+		TotalSize:  10,
+	}}}}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	resp, err := c.Downloads("docs/a.txt")
+	require.NoError(t, err)
+	require.Len(t, resp.Entries, 1)
+	assert.Equal(t, "docs/a.txt", resp.Entries[0].Path)
+	h.mu.Lock()
+	assert.Equal(t, "docs/a.txt", h.lastPath)
+	h.mu.Unlock()
+}
+
+func TestServerDownloadsError(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{downloadsErr: errors.New("db unavailable")}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = c.Downloads("docs/a.txt")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db unavailable")
 }
 
 // ---------- Protocol edge cases ----------

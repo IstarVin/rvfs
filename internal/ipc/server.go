@@ -18,6 +18,13 @@ type Handler interface {
 	HandleStatus() (StatusResponse, error)
 	// HandleSync triggers a sync cycle, clearing retry timers first if force==true.
 	HandleSync(force bool) error
+	// HandlePrefetch starts (or resumes) downloading path into the cache.
+	HandlePrefetch(path string) error
+	// HandleEvict removes path from the on-disk cache and marks it evicted.
+	HandleEvict(path string) error
+	// HandleDownloads returns download/cache status for path, or all active
+	// downloads when path is empty.
+	HandleDownloads(path string) (DownloadStatusResponse, error)
 }
 
 // Server listens on a UNIX socket and dispatches incoming requests to a Handler.
@@ -108,6 +115,27 @@ func (s *Server) handleConn(conn net.Conn) {
 				_ = enc.Encode(SyncResponse{OK: false, Err: err.Error()})
 			} else {
 				_ = enc.Encode(SyncResponse{OK: true})
+			}
+		case "prefetch":
+			err := s.handler.HandlePrefetch(req.Path)
+			if err != nil {
+				_ = enc.Encode(ActionResponse{OK: false, Err: err.Error()})
+			} else {
+				_ = enc.Encode(ActionResponse{OK: true})
+			}
+		case "evict":
+			err := s.handler.HandleEvict(req.Path)
+			if err != nil {
+				_ = enc.Encode(ActionResponse{OK: false, Err: err.Error()})
+			} else {
+				_ = enc.Encode(ActionResponse{OK: true})
+			}
+		case "downloads":
+			resp, err := s.handler.HandleDownloads(req.Path)
+			if err != nil {
+				_ = enc.Encode(map[string]string{"error": err.Error()})
+			} else {
+				_ = enc.Encode(resp)
 			}
 		default:
 			_ = enc.Encode(map[string]string{"error": "unknown command"})

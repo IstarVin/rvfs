@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,6 +94,7 @@ type Download struct {
 
 	mu          sync.Mutex
 	cond        *sync.Cond
+	prefetch    bool  // true when download was explicitly requested via Prefetch
 	seqPos      int64 // current position of the sequential download goroutine
 	lastReadPos int64 // furthest offset+size the reader has consumed
 	err         error // first fatal error
@@ -117,6 +119,16 @@ type goroutineInfo struct {
 	cancel       func()
 	pos          int64 // current download position (updated by the goroutine)
 	isSequential bool  // true for the single sequential fill goroutine
+}
+
+// Progress is a snapshot of one path's active download state.
+type Progress struct {
+	Path       string
+	State      string
+	Downloaded int64
+	TotalSize  int64
+	Done       bool
+	Err        string
 }
 
 // Start begins downloading a remote file into the cache. If a download for
@@ -243,6 +255,97 @@ func (m *Manager) Hint(path string, nextOffset int64) {
 	if !dl.hasGoroutineNear(nextOffset) {
 		dl.spawnGoroutine(nextOffset, false)
 	}
+}
+
+// Prefetch starts (or resumes) an asynchronous download for path.
+// It does not require a live reader handle.
+func (m *Manager) Prefetch(path string, totalSize int64) error {
+	m.mu.Lock()
+	if dl, ok := m.downloads[path]; ok {
+		dl.mu.Lock()
+		dl.prefetch = true
+		dl.cond.Broadcast()
+		dl.mu.Unlock()
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	dl, f, err := m.Start(path, totalSize)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+
+	dl.mu.Lock()
+	dl.prefetch = true
+	dl.cond.Broadcast()
+	dl.mu.Unlock()
+
+	// Balance the reader count added by Start() without cancelling the
+	// download: prefetch=true keeps ReleaseReader from stopping it.
+	dl.ReleaseReader()
+	return nil
+}
+
+// Snapshots returns active download progress. If path is non-empty, at most
+// one entry (for that path) is returned.
+func (m *Manager) Snapshots(path string) []Progress {
+	m.mu.Lock()
+	list := make([]*Download, 0, len(m.downloads))
+	if path != "" {
+		if dl, ok := m.downloads[path]; ok {
+			list = append(list, dl)
+		}
+	} else {
+		for _, dl := range m.downloads {
+			list = append(list, dl)
+		}
+	}
+	m.mu.Unlock()
+
+	out := make([]Progress, 0, len(list))
+	for _, dl := range list {
+		dl.mu.Lock()
+		p := Progress{
+			Path:       dl.path,
+			Downloaded: coveredBytes(dl.rangeSet.Intervals(), dl.totalSize),
+			TotalSize:  dl.totalSize,
+			Done:       dl.done,
+		}
+		switch {
+		case dl.done:
+			p.State = "complete"
+		case dl.err != nil:
+			p.State = "error"
+			p.Err = dl.err.Error()
+		default:
+			p.State = "downloading"
+		}
+		dl.mu.Unlock()
+		out = append(out, p)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+func coveredBytes(iv []Interval, totalSize int64) int64 {
+	if totalSize <= 0 {
+		return 0
+	}
+	var n int64
+	for _, r := range iv {
+		start := max(r.Start, 0)
+		end := min(r.End, totalSize)
+		if end > start {
+			n += end - start
+		}
+	}
+	if n > totalSize {
+		return totalSize
+	}
+	return n
 }
 
 // Cancel cancels all goroutines for a download and removes it from the manager.
@@ -515,7 +618,7 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 			if isSequential && dl.mgr.readAhead > 0 {
 				dl.mu.Lock()
 				pausedSince := time.Now()
-				for pos > dl.lastReadPos+dl.mgr.readAhead && !dl.done && dl.err == nil {
+				for !dl.prefetch && pos > dl.lastReadPos+dl.mgr.readAhead && !dl.done && dl.err == nil {
 					// If an idle timeout is configured and has elapsed while
 					// we've been waiting, stop downloading entirely. The
 					// goroutine will be restarted automatically by the next
@@ -551,6 +654,15 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 
 		if err != nil {
 			if err != io.EOF {
+				// Non-sequential goroutines are cancelled intentionally (e.g. when
+				// they fall far behind the active read position). Do not promote
+				// that cancellation into a fatal download error.
+				select {
+				case <-doneCh:
+					pr.Close()
+					return
+				default:
+				}
 				dl.mu.Lock()
 				if dl.err == nil {
 					dl.err = fmt.Errorf("download %q at offset %d: %w", dl.path, startOffset, err)
@@ -647,8 +759,9 @@ func (dl *Download) ReleaseReader() {
 	}
 	dl.mu.Lock()
 	done := dl.done
+	prefetch := dl.prefetch
 	dl.mu.Unlock()
-	if !done {
+	if !done && !prefetch {
 		dl.mgr.Cancel(dl.path)
 	}
 }

@@ -3,6 +3,7 @@ package download
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"testing"
 	"time"
@@ -411,4 +412,114 @@ func TestDownloadContextCancelledOnDone(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("adapter Get context was not cancelled after Cancel()")
 	}
+}
+
+func TestManagerPrefetchIgnoresReadAhead(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(3 * 1024 * 1024)
+	content := bytes.Repeat([]byte("p"), int(totalSize))
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+			_, err := dest.Write(content)
+			return err
+		},
+	}
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{ReadAhead: 1 * 1024 * 1024})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "prefetch.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	require.NoError(t, mgr.Prefetch("prefetch.bin", totalSize))
+
+	require.Eventually(t, func() bool {
+		entry, err := cl.Stat("prefetch.bin")
+		if err != nil || entry == nil || entry.State != cache.StateClean {
+			return false
+		}
+
+		var rs RangeSet
+		if err := json.Unmarshal([]byte(entry.CachedRanges), &rs); err != nil {
+			return false
+		}
+		return rs.IsComplete(totalSize)
+	}, 5*time.Second, 20*time.Millisecond, "prefetch should complete full download regardless of read-ahead")
+
+	assert.False(t, mgr.IsDownloading("prefetch.bin"), "prefetch should be removed after completion")
+}
+
+func TestManagerCancelledHelperGoroutineIsNotFatal(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(10 * 1024 * 1024)
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			for written := int64(0); written < totalSize; {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+
+				chunk := int64(64 * 1024)
+				if remaining := totalSize - written; remaining < chunk {
+					chunk = remaining
+				}
+				if _, err := dest.Write(bytes.Repeat([]byte("a"), int(chunk))); err != nil {
+					return err
+				}
+				written += chunk
+				time.Sleep(2 * time.Millisecond)
+			}
+			return nil
+		},
+		GetRangeFunc: func(ctx context.Context, path string, offset, length int64, dest io.Writer) error {
+			for sent := int64(0); sent < length; {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+
+				chunk := int64(64 * 1024)
+				if remaining := length - sent; remaining < chunk {
+					chunk = remaining
+				}
+				if _, err := dest.Write(bytes.Repeat([]byte("b"), int(chunk))); err != nil {
+					return err
+				}
+				sent += chunk
+				time.Sleep(2 * time.Millisecond)
+			}
+			return nil
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "cancel-helper.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	dl, f, err := mgr.Start("cancel-helper.bin", totalSize)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Spawn a non-sequential goroutine far ahead of the sequential stream,
+	// then force it to be cancelled as far-behind by a much later read.
+	mgr.Hint("cancel-helper.bin", 3*1024*1024)
+	require.NoError(t, dl.WaitForRange(8*1024*1024, 1))
+
+	// The intentional helper cancellation must not poison the whole download.
+	require.NoError(t, dl.WaitForRange(0, totalSize))
+
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("cancel-helper.bin")
+		return err == nil && e != nil && e.State == cache.StateClean
+	}, 8*time.Second, 20*time.Millisecond, "download should complete and be marked clean")
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/config"
 	"github.com/IstarVin/rvfs/internal/connectivity"
+	"github.com/IstarVin/rvfs/internal/download"
 	"github.com/IstarVin/rvfs/internal/fuse"
 	"github.com/IstarVin/rvfs/internal/ipc"
 	"github.com/IstarVin/rvfs/internal/remote"
@@ -272,6 +273,10 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 	// Create the sync engine before mounting so we can pass it to the FUSE
 	// layer for upload cancellation on Unlink. Start it after the mount is up.
 	engine := syncpkg.NewEngine(adapter, cl, mountPollInterval, mon, syncpkg.ConflictStrategy(mountConflictStrategy))
+	downloadMgr := download.NewManager(adapter, cl, mon, download.ManagerOptions{
+		ReadAhead:   mountReadAhead,
+		IdleTimeout: mountIdleTimeout,
+	})
 
 	_, server, err := fuse.Mount(cacheDir, remoteID, mountpoint, fuse.MountOptions{
 		Debug:           mountDebug,
@@ -281,6 +286,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		IdleTimeout:     mountIdleTimeout,
 		VerifyChecksums: mountVerifyChecksums,
 		SyncEngine:      engine,
+		DownloadManager: downloadMgr,
 	})
 	if err != nil {
 		cl.Close()
@@ -298,6 +304,7 @@ func mountRemote(remoteName, remotePath, mountpoint, cacheDir string) error {
 		mountpoint:   absMountpoint,
 		cl:           cl,
 		engine:       engine,
+		downloadMgr:  downloadMgr,
 		mon:          mon,
 		maxSize:      mountCacheSize,
 		minFreeSpace: mountCacheMinFreeSpace,
@@ -380,6 +387,7 @@ type mountHandler struct {
 	mountpoint   string
 	cl           *cache.CacheLayer
 	engine       *syncpkg.Engine
+	downloadMgr  *download.Manager
 	mon          *connectivity.Monitor
 	maxSize      int64
 	minFreeSpace int64
@@ -461,6 +469,78 @@ func (h *mountHandler) HandleSync(force bool) error {
 		_ = h.engine.PullOnce()
 	}()
 	return nil
+}
+
+func (h *mountHandler) HandlePrefetch(path string) error {
+	if path == "" {
+		return fmt.Errorf("prefetch: missing path")
+	}
+	if h.downloadMgr == nil {
+		return fmt.Errorf("prefetch unavailable: mount has no remote adapter")
+	}
+	entry, err := h.cl.DB().GetFile(path)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return fmt.Errorf("prefetch: path %q not found", path)
+	}
+	if entry.IsDir {
+		return fmt.Errorf("prefetch: %q is a directory", path)
+	}
+	if err := h.downloadMgr.Prefetch(path, entry.Size); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *mountHandler) HandleEvict(path string) error {
+	if path == "" {
+		return fmt.Errorf("evict: missing path")
+	}
+	return cache.EvictPath(h.cl, path)
+}
+
+func (h *mountHandler) HandleDownloads(path string) (ipc.DownloadStatusResponse, error) {
+	resp := ipc.DownloadStatusResponse{Entries: []ipc.DownloadStatusEntry{}}
+	if h.downloadMgr == nil {
+		return resp, nil
+	}
+
+	for _, s := range h.downloadMgr.Snapshots(path) {
+		resp.Entries = append(resp.Entries, ipc.DownloadStatusEntry{
+			Path:       s.Path,
+			State:      s.State,
+			Downloaded: s.Downloaded,
+			TotalSize:  s.TotalSize,
+			Done:       s.Done,
+			Err:        s.Err,
+		})
+	}
+
+	if path != "" && len(resp.Entries) == 0 {
+		e, err := h.cl.DB().GetFile(path)
+		if err != nil {
+			return resp, err
+		}
+		if e != nil {
+			downloaded := int64(0)
+			d := false
+			if e.State == cache.StateClean {
+				downloaded = e.Size
+				d = true
+			}
+			resp.Entries = append(resp.Entries, ipc.DownloadStatusEntry{
+				Path:       e.Path,
+				State:      string(e.State),
+				Downloaded: downloaded,
+				TotalSize:  e.Size,
+				Done:       d,
+			})
+		}
+	}
+
+	return resp, nil
 }
 
 // durationValue is a pflag.Value that parses Go duration strings

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -143,6 +144,23 @@ func evictEntry(cl *CacheLayer, e *FileEntry) {
 	if err := cl.db.SetState(e.Path, StateEvicted); err != nil {
 		slog.Warn("evict: set state failed", "path", e.Path, "err", err)
 	}
+}
+
+// EvictPath removes one cached file and marks its DB state as StateEvicted.
+// Missing on-disk files are tolerated. Directories are not evictable.
+func EvictPath(cl *CacheLayer, path string) error {
+	e, err := cl.db.GetFile(path)
+	if err != nil {
+		return fmt.Errorf("evict path %q: %w", path, err)
+	}
+	if e == nil {
+		return fmt.Errorf("evict path: %q not found", path)
+	}
+	if e.IsDir {
+		return fmt.Errorf("evict path: %q is a directory", path)
+	}
+	evictEntry(cl, e)
+	return nil
 }
 
 // dirSize returns the total byte size of all regular files under dir.
