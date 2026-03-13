@@ -226,7 +226,11 @@ func printPins(cl *cache.CacheLayer) error {
 	}
 
 	if pinsTree {
-		for _, line := range renderPinsTree(out) {
+		expanded, err := expandForTree(cl.DB(), out)
+		if err != nil {
+			return err
+		}
+		for _, line := range renderPinsTree(expanded) {
 			fmt.Println(line)
 		}
 		return nil
@@ -350,6 +354,31 @@ func collapseCandidates(db *cache.MetadataDB, pins []*cache.FileEntry) ([]pinned
 		}
 	}
 	return out, nil
+}
+
+func expandForTree(db *cache.MetadataDB, entries []pinnedOutput) ([]pinnedOutput, error) {
+	seen := make(map[string]struct{})
+	result := make([]pinnedOutput, 0, len(entries))
+	for _, e := range entries {
+		if _, ok := seen[e.Path]; !ok {
+			seen[e.Path] = struct{}{}
+			result = append(result, e)
+		}
+		if e.IsDir {
+			desc, err := db.ListDescendants(e.Path)
+			if err != nil {
+				return nil, fmt.Errorf("expand tree %q: %w", e.Path, err)
+			}
+			for _, d := range desc {
+				if _, ok := seen[d.Path]; !ok {
+					seen[d.Path] = struct{}{}
+					result = append(result, pinnedOutput{Path: d.Path, IsDir: d.IsDir})
+				}
+			}
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result, nil
 }
 
 func formatPinnedPath(e pinnedOutput) string {
