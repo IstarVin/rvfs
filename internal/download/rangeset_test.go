@@ -2,6 +2,7 @@ package download
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -208,4 +209,31 @@ func TestString(t *testing.T) {
 	rs := NewRangeSet()
 	rs.Add(0, 10)
 	assert.Equal(t, "[[0,10]]", rs.String())
+}
+
+func TestConcurrentAddAndMarshalJSON(t *testing.T) {
+	rs := NewRangeSet()
+
+	const writes = 128
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			rs.Add(int64(i*2), 2)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			data, err := json.Marshal(rs)
+			require.NoError(t, err)
+			assert.NotEmpty(t, data)
+		}
+	}()
+
+	wg.Wait()
+	assert.True(t, rs.Contains(0, writes*2))
 }

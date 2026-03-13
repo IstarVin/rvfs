@@ -3,6 +3,7 @@ package download
 import (
 	"encoding/json"
 	"sort"
+	"sync"
 )
 
 // Interval represents a half-open byte range [Start, End).
@@ -14,6 +15,7 @@ type Interval struct {
 // RangeSet is a sorted, auto-merging set of non-overlapping [Start, End) intervals.
 // It tracks which byte ranges of a file are available on disk.
 type RangeSet struct {
+	mu        sync.RWMutex
 	intervals []Interval
 }
 
@@ -28,6 +30,10 @@ func (rs *RangeSet) Add(offset, length int64) {
 	if length <= 0 {
 		return
 	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
 	newIv := Interval{Start: offset, End: offset + length}
 
 	// Find the position where this interval starts affecting existing ones.
@@ -68,6 +74,10 @@ func (rs *RangeSet) Contains(offset, length int64) bool {
 	if length <= 0 {
 		return true
 	}
+
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
 	target := Interval{Start: offset, End: offset + length}
 
 	idx := sort.Search(len(rs.intervals), func(i int) bool {
@@ -93,6 +103,10 @@ func (rs *RangeSet) Gaps(totalSize int64) []Interval {
 	if totalSize <= 0 {
 		return nil
 	}
+
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
 	var gaps []Interval
 	pos := int64(0)
 	for _, iv := range rs.intervals {
@@ -115,11 +129,17 @@ func (rs *RangeSet) Gaps(totalSize int64) []Interval {
 
 // Len returns the number of intervals.
 func (rs *RangeSet) Len() int {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
 	return len(rs.intervals)
 }
 
 // Intervals returns a copy of the intervals slice.
 func (rs *RangeSet) Intervals() []Interval {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
 	out := make([]Interval, len(rs.intervals))
 	copy(out, rs.intervals)
 	return out
@@ -127,6 +147,9 @@ func (rs *RangeSet) Intervals() []Interval {
 
 // MarshalJSON serializes the RangeSet to [[start,end], ...] format.
 func (rs *RangeSet) MarshalJSON() ([]byte, error) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
 	pairs := make([][2]int64, len(rs.intervals))
 	for i, iv := range rs.intervals {
 		pairs[i] = [2]int64{iv.Start, iv.End}
@@ -140,6 +163,10 @@ func (rs *RangeSet) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &pairs); err != nil {
 		return err
 	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
 	rs.intervals = make([]Interval, len(pairs))
 	for i, p := range pairs {
 		rs.intervals[i] = Interval{Start: p[0], End: p[1]}
