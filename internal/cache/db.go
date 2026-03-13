@@ -72,10 +72,20 @@ func OpenDB(dbPath string) (*MetadataDB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
+	// Serialise all writes through a single connection so concurrent goroutines
+	// in the sync engine cannot race for the write lock.
+	db.SetMaxOpenConns(1)
+
 	// WAL mode for concurrent read performance.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set WAL: %w", err)
+	}
+	// Retry for up to 5 s before returning SQLITE_BUSY, preventing spurious
+	// "database is locked" errors when multiple goroutines write concurrently.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		db.Close()
