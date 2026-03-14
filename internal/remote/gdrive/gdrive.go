@@ -1,12 +1,17 @@
 package gdrive
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +27,13 @@ import (
 var driveScopes = []string{drive.DriveScope}
 
 const PORT = 8089
+
+const (
+	maxDownloadRetries      = 6
+	initialRetryBackoff     = 500 * time.Millisecond
+	maxRetryBackoff         = 8 * time.Second
+	retryResponseBodyMaxLen = 64 * 1024
+)
 
 // GDriveAdapter implements remote.RemoteAdapter for Google Drive.
 type GDriveAdapter struct {
@@ -257,14 +269,9 @@ func (g *GDriveAdapter) Get(ctx context.Context, filePath string, dest io.Writer
 		return err
 	}
 
-	resp, err := g.srv.Files.Get(id).Context(ctx).Download()
-	if err != nil {
-		return fmt.Errorf("download %q: %w", filePath, err)
-	}
-	defer resp.Body.Close()
-
-	_, err = io.Copy(dest, resp.Body)
-	return err
+	// Stream with resumable range requests so transient network/rate-limit
+	// failures can continue from the last copied byte.
+	return g.streamWithRetry(ctx, id, filePath, 0, -1, dest)
 }
 
 func (g *GDriveAdapter) GetRange(ctx context.Context, filePath string, offset, length int64, dest io.Writer) error {
@@ -273,28 +280,7 @@ func (g *GDriveAdapter) GetRange(ctx context.Context, filePath string, offset, l
 		return err
 	}
 
-	// Build a range request manually via the HTTP client.
-	url := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s?alt=media", id)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
-	endByte := offset + length - 1
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, endByte))
-
-	// Use the oauth2 http client embedded in the service.
-	resp, err := g.httpClient().Do(req)
-	if err != nil {
-		return fmt.Errorf("get range %q: %w", filePath, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("get range %q: HTTP %d", filePath, resp.StatusCode)
-	}
-
-	_, err = io.Copy(dest, resp.Body)
-	return err
+	return g.streamWithRetry(ctx, id, filePath, offset, length, dest)
 }
 
 func (g *GDriveAdapter) Put(ctx context.Context, filePath string, src io.Reader, size int64, mtime time.Time) error {
@@ -568,6 +554,207 @@ func (g *GDriveAdapter) httpClient() *http.Client {
 		slog.Warn("gdrive: failed to reload token for range request", "err", err)
 	}
 	return g.oauthCfg.Client(context.Background(), tok)
+}
+
+// streamWithRetry downloads bytes for fileID into dest using HTTP range
+// requests with resumable retries for transient/rate-limit failures.
+// length < 0 means read from offset to EOF.
+func (g *GDriveAdapter) streamWithRetry(ctx context.Context, fileID, filePath string, offset, length int64, dest io.Writer) error {
+	if offset < 0 {
+		return fmt.Errorf("download %q: invalid negative offset %d", filePath, offset)
+	}
+	if length == 0 {
+		return nil
+	}
+	if length < -1 {
+		return fmt.Errorf("download %q: invalid length %d", filePath, length)
+	}
+
+	url := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s?alt=media", fileID)
+	var copied int64
+	attempt := 0
+
+	for {
+		if length >= 0 && copied >= length {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		currStart := offset + copied
+		rng := rangeHeader(currStart, length, copied)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("download %q: %w", filePath, err)
+		}
+		req.Header.Set("Range", rng)
+
+		resp, err := g.httpClient().Do(req)
+		if err != nil {
+			if !isRetryableTransferError(err) || attempt >= maxDownloadRetries {
+				return fmt.Errorf("download %q: %w", filePath, err)
+			}
+			if err := sleepWithRetry(ctx, retryDelay(attempt, 0)); err != nil {
+				return err
+			}
+			attempt++
+			continue
+		}
+
+		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, retryResponseBodyMaxLen))
+			_ = resp.Body.Close()
+
+			if isRetryableStatus(resp.StatusCode, body) && attempt < maxDownloadRetries {
+				delay := retryDelay(attempt, parseRetryAfter(resp.Header.Get("Retry-After")))
+				if err := sleepWithRetry(ctx, delay); err != nil {
+					return err
+				}
+				attempt++
+				continue
+			}
+
+			return fmt.Errorf("download %q: HTTP %d: %s", filePath, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		n, copyErr := io.Copy(dest, resp.Body)
+		_ = resp.Body.Close()
+		copied += n
+
+		if copyErr == nil {
+			attempt = 0
+			if length < 0 {
+				return nil
+			}
+			continue
+		}
+
+		if !isRetryableTransferError(copyErr) || attempt >= maxDownloadRetries {
+			return fmt.Errorf("download %q: %w", filePath, copyErr)
+		}
+
+		if err := sleepWithRetry(ctx, retryDelay(attempt, 0)); err != nil {
+			return err
+		}
+		attempt++
+	}
+}
+
+func rangeHeader(start, length, copied int64) string {
+	if length < 0 {
+		return fmt.Sprintf("bytes=%d-", start)
+	}
+	end := start + (length - copied) - 1
+	return fmt.Sprintf("bytes=%d-%d", start, end)
+}
+
+func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
+	d := initialRetryBackoff << attempt
+	if d > maxRetryBackoff {
+		d = maxRetryBackoff
+	}
+	if retryAfter > d {
+		d = retryAfter
+	}
+	if d <= 0 {
+		return initialRetryBackoff
+	}
+	return d
+}
+
+func sleepWithRetry(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func isRetryableTransferError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+
+	var ne net.Error
+	if errors.As(err, &ne) {
+		if ne.Timeout() {
+			return true
+		}
+		if te, ok := any(ne).(interface{ Temporary() bool }); ok && te.Temporary() {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isRetryableStatus(code int, body []byte) bool {
+	if code == http.StatusTooManyRequests {
+		return true
+	}
+	if code == http.StatusForbidden {
+		reason := parseGoogleErrorReason(body)
+		return reason == "rateLimitExceeded" || reason == "userRateLimitExceeded"
+	}
+	return code == http.StatusInternalServerError ||
+		code == http.StatusBadGateway ||
+		code == http.StatusServiceUnavailable ||
+		code == http.StatusGatewayTimeout
+}
+
+func parseGoogleErrorReason(body []byte) string {
+	type errReason struct {
+		Reason string `json:"reason"`
+	}
+	type errBody struct {
+		Errors []errReason `json:"errors"`
+	}
+	type envelope struct {
+		Error errBody `json:"error"`
+	}
+
+	var e envelope
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&e); err != nil {
+		return ""
+	}
+	if len(e.Error.Errors) == 0 {
+		return ""
+	}
+	return e.Error.Errors[0].Reason
+}
+
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return 0
+	}
+	d := time.Until(t)
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // escapeQuery escapes a string for use in Drive API query parameters.

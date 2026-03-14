@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/IstarVin/rvfs/internal/cache"
+	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/testutil"
 )
 
@@ -345,6 +346,22 @@ func TestManagerCancelIdempotent(t *testing.T) {
 	mgr.Cancel("nonexistent.bin")
 }
 
+func TestManagerCloseIdempotent(t *testing.T) {
+	t.Parallel()
+
+	adapter := &testutil.MockRemoteAdapter{}
+	cl, err := cache.NewCacheLayer(t.TempDir(), "test-remote")
+	require.NoError(t, err)
+	t.Cleanup(func() { cl.Close() })
+
+	mon := connectivity.New(adapter, 50*time.Millisecond, 1)
+	mgr := NewManager(adapter, cl, mon, ManagerOptions{})
+
+	// Close should be safe to call multiple times.
+	mgr.Close()
+	mgr.Close()
+}
+
 // ---------- Phase-4 tests ----------
 
 // TestDownloadNetworkErrorMidStream verifies that a mid-stream I/O error from
@@ -372,7 +389,9 @@ func TestDownloadNetworkErrorMidStream(t *testing.T) {
 
 	err = mgr.WaitForRange("partial.bin", 0, 1024)
 	assert.Error(t, err, "WaitForRange should propagate mid-stream error")
-	assert.False(t, mgr.IsDownloading("partial.bin"),
+	require.Eventually(t, func() bool {
+		return !mgr.IsDownloading("partial.bin")
+	}, 2*time.Second, 10*time.Millisecond,
 		"download should be removed from manager after error")
 }
 

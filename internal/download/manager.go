@@ -60,6 +60,8 @@ type Manager struct {
 
 	mu        sync.Mutex
 	downloads map[string]*Download
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // NewManager creates a Download Manager. monitor may be nil; when non-nil,
@@ -72,11 +74,19 @@ func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer, monitor *con
 		readAhead:   opts.ReadAhead,
 		idleTimeout: opts.IdleTimeout,
 		downloads:   make(map[string]*Download),
+		stopCh:      make(chan struct{}),
 	}
 	if monitor != nil {
 		go m.watchOffline()
 	}
 	return m
+}
+
+// Close stops manager background goroutines.
+func (m *Manager) Close() {
+	m.closeOnce.Do(func() {
+		close(m.stopCh)
+	})
 }
 
 // Download tracks the state of a single file being downloaded.
@@ -376,12 +386,16 @@ func (m *Manager) IsDownloading(path string) bool {
 func (m *Manager) watchOffline() {
 	ch := m.monitor.Subscribe()
 	for {
-		state, ok := <-ch
-		if !ok {
+		select {
+		case <-m.stopCh:
 			return
-		}
-		if state == connectivity.StateOffline {
-			m.cancelAll()
+		case state, ok := <-ch:
+			if !ok {
+				return
+			}
+			if state == connectivity.StateOffline {
+				m.cancelAll()
+			}
 		}
 	}
 }
@@ -520,11 +534,12 @@ func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh ch
 	defer func() {
 		dl.mu.Lock()
 		delete(dl.goroutines, startOffset)
-		if dl.rangeSet.IsComplete(dl.totalSize) && !dl.done {
+		remaining := len(dl.goroutines)
+		if remaining == 0 && dl.rangeSet.IsComplete(dl.totalSize) && !dl.done {
 			dl.done = true
 			dl.cond.Broadcast()
 			go dl.finish()
-		} else if len(dl.goroutines) == 0 && dl.err != nil && !dl.done {
+		} else if remaining == 0 && dl.err != nil && !dl.done {
 			// All goroutines have exited due to error — remove from manager map
 			// so future Start() calls can retry the download.
 			dl.done = true
