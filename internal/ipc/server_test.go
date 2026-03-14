@@ -80,13 +80,14 @@ func startTestServer(t *testing.T, h Handler) string {
 func TestServerStatusHappyPath(t *testing.T) {
 	t.Parallel()
 	want := StatusResponse{
-		Source:     "gdrive:Documents",
-		Mountpoint: "/mnt/docs",
-		Online:     true,
-		CacheUsed:  1024,
-		CacheTotal: 4096,
-		Pending:    3,
-		Conflicts:  1,
+		Source:           "gdrive:Documents",
+		Mountpoint:       "/mnt/docs",
+		Online:           true,
+		CacheUsed:        1024,
+		CacheLogicalUsed: 3072,
+		CacheTotal:       4096,
+		Pending:          3,
+		Conflicts:        1,
 	}
 	h := &mockHandler{statusResp: want}
 	sockPath := startTestServer(t, h)

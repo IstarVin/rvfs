@@ -167,14 +167,29 @@ func printStatus(w io.Writer, r ipc.StatusResponse, showHints bool) {
 				avail = remaining
 			}
 		}
-		cacheStr = fmt.Sprintf("%s used, %s available to fill",
-			humanBytes(r.CacheUsed), humanBytes(avail))
+		if r.CacheLogicalUsed > 0 && r.CacheLogicalUsed != r.CacheUsed {
+			cacheStr = fmt.Sprintf("%s used on disk (%s logical), %s available to fill",
+				humanBytes(r.CacheUsed), humanBytes(r.CacheLogicalUsed), humanBytes(avail))
+		} else {
+			cacheStr = fmt.Sprintf("%s used, %s available to fill",
+				humanBytes(r.CacheUsed), humanBytes(avail))
+		}
 	} else if r.CacheTotal > 0 {
 		pct := float64(r.CacheUsed) / float64(r.CacheTotal) * 100
-		cacheStr = fmt.Sprintf("%s / %s (%.0f%%)",
-			humanBytes(r.CacheUsed), humanBytes(r.CacheTotal), pct)
+		if r.CacheLogicalUsed > 0 && r.CacheLogicalUsed != r.CacheUsed {
+			cacheStr = fmt.Sprintf("%s on disk (%s logical) / %s (%.0f%%)",
+				humanBytes(r.CacheUsed), humanBytes(r.CacheLogicalUsed), humanBytes(r.CacheTotal), pct)
+		} else {
+			cacheStr = fmt.Sprintf("%s / %s (%.0f%%)",
+				humanBytes(r.CacheUsed), humanBytes(r.CacheTotal), pct)
+		}
 	} else if r.CacheUsed > 0 {
-		cacheStr = humanBytes(r.CacheUsed)
+		if r.CacheLogicalUsed > 0 && r.CacheLogicalUsed != r.CacheUsed {
+			cacheStr = fmt.Sprintf("%s on disk (%s logical)",
+				humanBytes(r.CacheUsed), humanBytes(r.CacheLogicalUsed))
+		} else {
+			cacheStr = humanBytes(r.CacheUsed)
+		}
 	}
 
 	pendingLabel := fmt.Sprintf("%d %s waiting", r.Pending, pluralize(r.Pending, "upload", "uploads"))

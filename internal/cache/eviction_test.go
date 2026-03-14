@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -62,6 +63,47 @@ func TestDirSize_NonexistentDir(t *testing.T) {
 	t.Parallel()
 	_, err := DirSize("/nonexistent/dir/that/does/not/exist")
 	assert.Error(t, err)
+}
+
+func TestDirUsage_NestedFiles(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sub"), 0755))
+	aPath := filepath.Join(dir, "a.txt")
+	bPath := filepath.Join(dir, "sub", "b.txt")
+	require.NoError(t, os.WriteFile(aPath, make([]byte, 100), 0644))
+	require.NoError(t, os.WriteFile(bPath, make([]byte, 200), 0644))
+
+	usage, err := DirUsage(dir)
+	require.NoError(t, err)
+	assert.Equal(t, int64(300), usage.LogicalBytes)
+	assert.Equal(t, expectedPhysicalBytes(t, aPath)+expectedPhysicalBytes(t, bPath), usage.PhysicalBytes)
+}
+
+func TestDirUsage_EmptyDir(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	usage, err := DirUsage(dir)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), usage.LogicalBytes)
+	assert.Equal(t, int64(0), usage.PhysicalBytes)
+}
+
+func TestDirUsage_NonexistentDir(t *testing.T) {
+	t.Parallel()
+	_, err := DirUsage("/nonexistent/dir/that/does/not/exist")
+	assert.Error(t, err)
+}
+
+func expectedPhysicalBytes(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	st, ok := info.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	return st.Blocks * 512
 }
 
 // ---------- evictByAge ----------

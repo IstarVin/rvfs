@@ -163,9 +163,25 @@ func EvictPath(cl *CacheLayer, path string) error {
 	return nil
 }
 
+// UsageStats summarizes logical and physical byte usage for cache files.
+// LogicalBytes is the sum of file lengths. PhysicalBytes is allocated blocks.
+type UsageStats struct {
+	LogicalBytes  int64
+	PhysicalBytes int64
+}
+
 // dirSize returns the total byte size of all regular files under dir.
 func dirSize(dir string) (int64, error) {
-	var total int64
+	usage, err := dirUsage(dir)
+	if err != nil {
+		return 0, err
+	}
+	return usage.LogicalBytes, nil
+}
+
+// dirUsage returns logical and physical byte usage for all regular files under dir.
+func dirUsage(dir string) (UsageStats, error) {
+	var usage UsageStats
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
@@ -174,14 +190,27 @@ func dirSize(dir string) (int64, error) {
 		if err != nil {
 			return nil // skip unreadable files
 		}
-		total += info.Size()
+		logical := info.Size()
+		usage.LogicalBytes += logical
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			usage.PhysicalBytes += st.Blocks * 512
+			return nil
+		}
+
+		// Fallback for platforms/filesystems where block allocation isn't exposed.
+		usage.PhysicalBytes += logical
 		return nil
 	})
-	return total, err
+	return usage, err
 }
 
 // DirSize is the exported version of dirSize, used by callers outside the
 // cache package (e.g. the IPC status handler in the CLI).
 func DirSize(dir string) (int64, error) {
 	return dirSize(dir)
+}
+
+// DirUsage returns both logical and physical byte usage under dir.
+func DirUsage(dir string) (UsageStats, error) {
+	return dirUsage(dir)
 }

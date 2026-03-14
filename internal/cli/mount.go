@@ -594,7 +594,7 @@ func handleServiceInstall(source, mountpoint string, _ []string, cmd *cobra.Comm
 func (h *mountHandler) HandleStatus() (ipc.StatusResponse, error) {
 	pending, _ := h.cl.DB().CountPendingOps()
 	conflicts, _ := h.cl.DB().CountConflicts()
-	used, _ := cache.DirSize(h.cl.FilesDir())
+	usage, _ := cache.DirUsage(h.cl.FilesDir())
 	online := h.mon != nil && h.mon.State() == connectivity.StateOnline
 
 	var fsFree int64
@@ -609,7 +609,8 @@ func (h *mountHandler) HandleStatus() (ipc.StatusResponse, error) {
 		Source:            h.source,
 		Mountpoint:        h.mountpoint,
 		Online:            online,
-		CacheUsed:         used,
+		CacheUsed:         usage.PhysicalBytes,
+		CacheLogicalUsed:  usage.LogicalBytes,
 		CacheTotal:        h.maxSize,
 		CacheMinFreeSpace: h.minFreeSpace,
 		CacheFSFree:       fsFree,

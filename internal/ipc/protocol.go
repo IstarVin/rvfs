@@ -27,8 +27,10 @@ type StatusResponse struct {
 	Mountpoint string `json:"mountpoint"`
 	// Online is "true" when the remote is reachable, "false" otherwise.
 	Online bool `json:"online"`
-	// CacheUsed is the total on-disk bytes currently used in the files/ dir.
+	// CacheUsed is the physically allocated on-disk bytes in the files/ dir.
 	CacheUsed int64 `json:"cache_used"`
+	// CacheLogicalUsed is the sum of logical file sizes in the files/ dir.
+	CacheLogicalUsed int64 `json:"cache_logical_used,omitempty"`
 	// CacheTotal is the configured max cache size (0 = unlimited).
 	CacheTotal int64 `json:"cache_total"`
 	// CacheMinFreeSpace is the configured minimum free space threshold (0 = disabled).
