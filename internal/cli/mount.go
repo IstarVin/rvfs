@@ -518,7 +518,7 @@ func recoverDownloads(cl *cache.CacheLayer, adapter remote.RemoteAdapter) {
 	for _, e := range entries {
 		if !adapter.SupportsRange() {
 			// Cannot resume from partial ranges — restart from scratch.
-			if setErr := cl.DB().SetState(e.Path, cache.StateEvicted); setErr != nil {
+			if setErr := cl.DB().MarkEvicted(e.Path); setErr != nil {
 				slog.Warn("recover download: reset to evicted", "path", e.Path, "err", setErr)
 			} else {
 				slog.Info("recover download: reset to evicted (no range support)", "path", e.Path)

@@ -395,7 +395,7 @@ func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		if entry != nil && entry.Checksum != "" {
 			if corrupt := verifyCacheFile(f, entry.Checksum); corrupt {
 				f.Close()
-				_ = n.root.cache.DB().SetState(n.rel, cache.StateEvicted)
+				_ = n.root.cache.DB().MarkEvicted(n.rel)
 				// Retry Open — subsequent reads will trigger a fresh download.
 				return n.Open(ctx, flags)
 			}

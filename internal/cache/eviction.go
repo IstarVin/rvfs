@@ -141,8 +141,8 @@ func evictEntry(cl *CacheLayer, e *FileEntry) {
 	if err := os.Remove(dp); err != nil && !os.IsNotExist(err) {
 		return
 	}
-	if err := cl.db.SetState(e.Path, StateEvicted); err != nil {
-		slog.Warn("evict: set state failed", "path", e.Path, "err", err)
+	if err := cl.db.MarkEvicted(e.Path); err != nil {
+		slog.Warn("evict: mark evicted failed", "path", e.Path, "err", err)
 	}
 }
 

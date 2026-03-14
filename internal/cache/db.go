@@ -238,6 +238,23 @@ func (m *MetadataDB) SetState(path string, state FileState) error {
 	return nil
 }
 
+// MarkEvicted resets cache-local transient metadata for path and marks it
+// StateEvicted so subsequent opens trigger re-download.
+func (m *MetadataDB) MarkEvicted(path string) error {
+	res, err := m.db.Exec(`
+		UPDATE files
+		SET state = ?, cached_ranges = '', sync_error = '', retry_after = 0
+		WHERE path = ?`, StateEvicted, path)
+	if err != nil {
+		return fmt.Errorf("mark evicted %q: %w", path, err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("mark evicted: path %q not found", path)
+	}
+	return nil
+}
+
 // ListDir returns the immediate children of dirPath.
 // dirPath should be "" for the root directory.
 func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
@@ -713,9 +730,46 @@ func (m *MetadataDB) ListEvictable() ([]*FileEntry, error) {
 	return result, rows.Err()
 }
 
-// ListCleanFiles returns clean, non-directory entries ordered by last_access
-// ascending (least recently accessed first). When includePinned is false,
-// pinned entries are excluded.
+// ListCleanupCandidates returns non-directory entries that are safe to remove
+// from local cache via the CLI cleanup command. It includes files in clean,
+// downloading, or evicted states ordered by last_access ascending (least
+// recently accessed first). When includePinned is false, pinned entries are
+// excluded.
+func (m *MetadataDB) ListCleanupCandidates(includePinned bool) ([]*FileEntry, error) {
+	query := `
+		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
+		FROM files
+		WHERE cached_ranges != '' AND is_dir = 0`
+	if !includePinned {
+		query += ` AND pinned = 0`
+	}
+	query += ` ORDER BY last_access ASC`
+
+	rows, err := m.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("list cleanup candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*FileEntry
+	for rows.Next() {
+		e := &FileEntry{}
+		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
+			&e.RemoteMtime, &e.LocalMtime,
+			&e.CachePath, &e.State, &e.CachedRanges,
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
+			return nil, fmt.Errorf("scan cleanup candidate: %w", err)
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// ListCleanFiles is kept for backward compatibility with existing callers and
+// tests that only need clean-state files.
 func (m *MetadataDB) ListCleanFiles(includePinned bool) ([]*FileEntry, error) {
 	query := `
 		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,

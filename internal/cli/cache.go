@@ -17,11 +17,11 @@ var cacheCmd = &cobra.Command{
 
 var cacheCleanCmd = &cobra.Command{
 	Use:   "clean <source|mount-path>",
-	Short: "Evict clean files from local cache",
-	Long: `Evict clean files from local cache for a source or active mount path.
+	Short: "Evict clean/downloading/evicted files from local cache",
+	Long: `Evict clean/downloading/evicted files from local cache for a source or active mount path.
 
 By default pinned files are kept. Use --include-pinned to evict pinned
-clean files as well. Dirty/syncing/downloading/conflict files are never
+clean/downloading/evicted files as well. Dirty/syncing/conflict files are never
 evicted by this command.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -31,7 +31,7 @@ evicted by this command.`,
 		}
 		defer cl.Close()
 
-		entries, err := cl.DB().ListCleanFiles(cacheCleanIncludePinned)
+		entries, err := cl.DB().ListCleanupCandidates(cacheCleanIncludePinned)
 		if err != nil {
 			return fmt.Errorf("list cache cleanup candidates: %w", err)
 		}
