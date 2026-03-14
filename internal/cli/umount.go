@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/IstarVin/rvfs/internal/ipc"
@@ -34,24 +35,69 @@ unmounting. Press Ctrl-C to abort the wait and unmount immediately.
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mountpoint := args[0]
-		absMountpoint, _ := filepath.Abs(mountpoint)
-		summary := drainResult{}
-
-		reg, regErr := ipc.OpenMountRegistry()
-		if regErr == nil {
-			defer reg.Close()
-			entry, alive, _ := reg.Lookup(absMountpoint)
-			if alive {
-				summary = drainPending(cmd, entry)
-			} else {
-				printWarning(cmd.ErrOrStderr(), "check 'rvfs queue' first to ensure all uploads are complete")
-			}
-		} else {
-			printWarning(cmd.ErrOrStderr(), "check 'rvfs queue' first to ensure all uploads are complete")
+		absMountpoint, err := filepath.Abs(mountpoint)
+		if err != nil {
+			return fmt.Errorf("resolve mountpoint: %w", err)
 		}
 
-		return unmount(cmd, mountpoint, summary)
+		isMP, err := isMountpoint(absMountpoint)
+		if err != nil {
+			return fmt.Errorf("check mountpoint %q: %w", absMountpoint, err)
+		}
+		if !isMP {
+			return fmt.Errorf("%q is not a mountpoint", absMountpoint)
+		}
+
+		reg, err := ipc.OpenMountRegistry()
+		if err != nil {
+			return fmt.Errorf("open mount registry: %w", err)
+		}
+		defer reg.Close()
+
+		entry, alive, err := reg.Lookup(absMountpoint)
+		if err != nil {
+			return fmt.Errorf("lookup mountpoint in registry: %w", err)
+		}
+		if !alive {
+			return fmt.Errorf("%q is mounted but not managed by rvfs", absMountpoint)
+		}
+
+		summary := drainPending(cmd, entry)
+		return unmount(cmd, absMountpoint, summary)
 	},
+}
+
+// isMountpoint returns whether path is a mountpoint by comparing inode/device
+// metadata against its parent directory.
+func isMountpoint(path string) (bool, error) {
+	cleanPath := filepath.Clean(path)
+
+	st, err := os.Stat(cleanPath)
+	if err != nil {
+		return false, err
+	}
+	parentPath := filepath.Dir(cleanPath)
+	parentSt, err := os.Stat(parentPath)
+	if err != nil {
+		return false, err
+	}
+
+	cur, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("unexpected stat type for %q", cleanPath)
+	}
+	parent, ok := parentSt.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("unexpected stat type for %q", parentPath)
+	}
+
+	if cur.Dev != parent.Dev {
+		return true, nil
+	}
+	if cur.Ino == parent.Ino {
+		return true, nil
+	}
+	return false, nil
 }
 
 // drainPending connects to the running mount, shows pending op count, and
