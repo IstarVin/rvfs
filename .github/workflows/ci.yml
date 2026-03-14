@@ -24,6 +24,9 @@ jobs:
       - name: Install FUSE
         run: sudo apt-get install -y fuse libfuse-dev
 
+      - name: Configure FUSE
+        run: echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+
       - name: Verify dependencies
         run: go mod tidy && git diff --exit-code go.mod go.sum
 
