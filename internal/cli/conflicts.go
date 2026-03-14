@@ -39,11 +39,7 @@ var conflictsCmd = &cobra.Command{
 
 		cacheDir := conflictsCacheDir
 		if cacheDir == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return fmt.Errorf("home dir: %w", err)
-			}
-			cacheDir = filepath.Join(home, ".cache", "rvfs")
+			cacheDir = getCacheDir()
 		}
 
 		cl, err := cache.NewCacheLayer(cacheDir, remoteName)
@@ -133,11 +129,7 @@ var resolveCmd = &cobra.Command{
 
 		cacheDir := resolveCacheDir
 		if cacheDir == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return fmt.Errorf("home dir: %w", err)
-			}
-			cacheDir = filepath.Join(home, ".cache", "rvfs")
+			cacheDir = getCacheDir()
 		}
 
 		if !resolveAll && len(args) < 2 {
@@ -351,10 +343,10 @@ func parseSource(source string) (remoteName, subPath string, err error) {
 }
 
 func init() {
-	conflictsCmd.Flags().StringVar(&conflictsCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
+	conflictsCmd.Flags().StringVar(&conflictsCacheDir, "cache-dir", "", "Cache directory (default from config, fallback ~/.cache/rvfs)")
 	conflictsCmd.Flags().BoolVar(&conflictsJSON, "json", false, "Output machine-readable JSON")
 
 	resolveCmd.Flags().StringVar(&resolveKeep, "keep", "", "Resolution strategy: local, remote, or both (required)")
 	resolveCmd.Flags().BoolVar(&resolveAll, "all", false, "Resolve all conflicts")
-	resolveCmd.Flags().StringVar(&resolveCacheDir, "cache-dir", "", "Cache directory (default ~/.cache/rvfs)")
+	resolveCmd.Flags().StringVar(&resolveCacheDir, "cache-dir", "", "Cache directory (default from config, fallback ~/.cache/rvfs)")
 }
