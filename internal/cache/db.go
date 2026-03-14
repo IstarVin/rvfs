@@ -713,6 +713,42 @@ func (m *MetadataDB) ListEvictable() ([]*FileEntry, error) {
 	return result, rows.Err()
 }
 
+// ListCleanFiles returns clean, non-directory entries ordered by last_access
+// ascending (least recently accessed first). When includePinned is false,
+// pinned entries are excluded.
+func (m *MetadataDB) ListCleanFiles(includePinned bool) ([]*FileEntry, error) {
+	query := `
+		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
+		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
+		       pinned, last_access
+		FROM files
+		WHERE state = 'clean' AND is_dir = 0`
+	if !includePinned {
+		query += ` AND pinned = 0`
+	}
+	query += ` ORDER BY last_access ASC`
+
+	rows, err := m.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("list clean files: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*FileEntry
+	for rows.Next() {
+		e := &FileEntry{}
+		if err := rows.Scan(&e.Path, &e.IsDir, &e.Size, &e.Mode,
+			&e.RemoteMtime, &e.LocalMtime,
+			&e.CachePath, &e.State, &e.CachedRanges,
+			&e.SyncError, &e.RetryAfter, &e.Checksum,
+			&e.Pinned, &e.LastAccess); err != nil {
+			return nil, fmt.Errorf("scan clean entry: %w", err)
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
 // CountPendingOps returns the number of rows in pending_ops.
 func (m *MetadataDB) CountPendingOps() (int, error) {
 	var n int

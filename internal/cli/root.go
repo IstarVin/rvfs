@@ -38,6 +38,7 @@ func Execute() error {
 
 func init() {
 	rootCmd.AddCommand(mountCmd)
+	rootCmd.AddCommand(cacheCmd)
 	rootCmd.AddCommand(remoteCmd)
 	rootCmd.AddCommand(conflictsCmd)
 	rootCmd.AddCommand(resolveCmd)

@@ -159,6 +159,48 @@ func TestListByState(t *testing.T) {
 	assert.Len(t, dirty, 2)
 }
 
+func TestListCleanFiles_DefaultSkipsPinnedAndDirectories(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	entries := []*FileEntry{
+		{Path: "old-unpinned.txt", State: StateClean, Mode: 0100644, LastAccess: 10, Pinned: false},
+		{Path: "new-unpinned.txt", State: StateClean, Mode: 0100644, LastAccess: 20, Pinned: false},
+		{Path: "pinned.txt", State: StateClean, Mode: 0100644, LastAccess: 5, Pinned: true},
+		{Path: "dir", State: StateClean, IsDir: true, Mode: 040755, LastAccess: 1, Pinned: false},
+		{Path: "dirty.txt", State: StateDirty, Mode: 0100644, LastAccess: 0, Pinned: false},
+	}
+	for _, e := range entries {
+		require.NoError(t, db.PutFile(e))
+	}
+
+	got, err := db.ListCleanFiles(false)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "old-unpinned.txt", got[0].Path)
+	assert.Equal(t, "new-unpinned.txt", got[1].Path)
+}
+
+func TestListCleanFiles_IncludePinned(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	entries := []*FileEntry{
+		{Path: "unpinned.txt", State: StateClean, Mode: 0100644, LastAccess: 20, Pinned: false},
+		{Path: "pinned.txt", State: StateClean, Mode: 0100644, LastAccess: 10, Pinned: true},
+		{Path: "syncing.txt", State: StateSyncing, Mode: 0100644, LastAccess: 1, Pinned: false},
+	}
+	for _, e := range entries {
+		require.NoError(t, db.PutFile(e))
+	}
+
+	got, err := db.ListCleanFiles(true)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "pinned.txt", got[0].Path)
+	assert.Equal(t, "unpinned.txt", got[1].Path)
+}
+
 func TestDeleteFile(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)
