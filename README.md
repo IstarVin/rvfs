@@ -49,6 +49,7 @@ rvfs mount my-drive:Documents ~/mnt/docs
 ```
 
 The mountpoint is ready immediately. Files are streamed into the local cache on first access and synced back to the remote after writes.
+On Linux, `df ~/mnt/docs` will show the RVFS mount. For remotes that expose quota information, RVFS reports the remote account's capacity and free space; for Google Drive subfolder mounts, those values are account-level rather than scoped to the mounted folder.
 
 ### 3. Check status
 

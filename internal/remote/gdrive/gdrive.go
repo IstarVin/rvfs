@@ -422,6 +422,25 @@ func (g *GDriveAdapter) Probe(ctx context.Context) error {
 	return nil
 }
 
+func (g *GDriveAdapter) Quota(ctx context.Context) (remote.QuotaInfo, error) {
+	about, err := g.srv.About.Get().Fields("storageQuota(limit,usage)").Context(ctx).Do()
+	if err != nil {
+		return remote.QuotaInfo{}, fmt.Errorf("quota: %w", err)
+	}
+	if about.StorageQuota == nil || about.StorageQuota.Limit <= 0 {
+		return remote.QuotaInfo{}, nil
+	}
+
+	total := about.StorageQuota.Limit
+	used := about.StorageQuota.Usage
+
+	return remote.QuotaInfo{
+		TotalBytes:     total,
+		UsedBytes:      used,
+		AvailableBytes: total - used,
+	}.Normalized(), nil
+}
+
 func (g *GDriveAdapter) SupportsRange() bool {
 	return true
 }

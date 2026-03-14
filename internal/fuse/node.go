@@ -15,17 +15,24 @@ import (
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/connectivity"
 	"github.com/IstarVin/rvfs/internal/download"
+	"github.com/IstarVin/rvfs/internal/remote"
 	syncpkg "github.com/IstarVin/rvfs/internal/sync"
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+const (
+	statfsBlockSize   = 4096
+	defaultStatfsFile = 1 << 20
+)
+
 // RootState holds shared state for all nodes in the FUSE tree.
 type RootState struct {
 	cache       *cache.CacheLayer
-	downloadMgr *download.Manager      // nil when using backing-dir mode
-	monitor     *connectivity.Monitor  // nil when using backing-dir mode
-	syncEngine  *syncpkg.Engine        // nil when using backing-dir mode
+	adapter     remote.RemoteAdapter
+	downloadMgr *download.Manager     // nil when using backing-dir mode
+	monitor     *connectivity.Monitor // nil when using backing-dir mode
+	syncEngine  *syncpkg.Engine       // nil when using backing-dir mode
 
 	// writeMu serialises concurrent writes to the same path within this
 	// process. The map stores *sync.Mutex values keyed by relative path.
@@ -34,6 +41,12 @@ type RootState struct {
 	// verifyChecksums, when true, hashes clean cache files on Open and
 	// evicts them if the checksum does not match the stored value.
 	verifyChecksums bool
+
+	quotaTTL       time.Duration
+	quotaMu        sync.Mutex
+	quota          remote.QuotaInfo
+	quotaFetchedAt time.Time
+	quotaValid     bool
 }
 
 // FuseNode is a node in the FUSE filesystem tree.
@@ -129,6 +142,72 @@ func toErrno(err error) syscall.Errno {
 	return syscall.EIO
 }
 
+func (r *RootState) quotaSnapshot(ctx context.Context) (remote.QuotaInfo, bool) {
+	if r.adapter == nil {
+		return remote.QuotaInfo{}, false
+	}
+
+	r.quotaMu.Lock()
+	defer r.quotaMu.Unlock()
+
+	now := time.Now()
+	if r.quotaValid && (r.quotaTTL <= 0 || now.Sub(r.quotaFetchedAt) < r.quotaTTL) {
+		return r.quota, true
+	}
+
+	quota, err := r.adapter.Quota(ctx)
+	if err == nil {
+		quota = quota.Normalized()
+		if quota.Valid() {
+			r.quota = quota
+			r.quotaFetchedAt = now
+			r.quotaValid = true
+			return quota, true
+		}
+	}
+
+	if r.quotaValid {
+		return r.quota, true
+	}
+
+	return remote.QuotaInfo{}, false
+}
+
+func fillStatfsFromSystem(st *syscall.Statfs_t, out *gofuse.StatfsOut) {
+	out.Blocks = st.Blocks
+	out.Bfree = st.Bfree
+	out.Bavail = st.Bavail
+	out.Files = st.Files
+	out.Ffree = st.Ffree
+	out.Bsize = uint32(st.Bsize)
+	out.Frsize = uint32(st.Frsize)
+	out.NameLen = uint32(st.Namelen)
+}
+
+func fillStatfsFromQuota(quota remote.QuotaInfo, out *gofuse.StatfsOut) {
+	quota = quota.Normalized()
+	if !quota.Valid() {
+		return
+	}
+
+	blocks := uint64((quota.TotalBytes + statfsBlockSize - 1) / statfsBlockSize)
+	available := uint64(quota.AvailableBytes / statfsBlockSize)
+	used := uint64(quota.UsedBytes / statfsBlockSize)
+	free := available
+	if blocks > used && blocks-used < free {
+		free = blocks - used
+	}
+
+	out.Blocks = blocks
+	out.Bfree = free
+	out.Bavail = available
+	out.Files = defaultStatfsFile
+	out.Ffree = defaultStatfsFile
+	out.Bsize = statfsBlockSize
+	out.Frsize = statfsBlockSize
+	out.NameLen = 255
+}
+
 // --- NodeLookuper ---
 
 var _ fs.NodeLookuper = (*FuseNode)(nil)
@@ -158,6 +237,26 @@ func (n *FuseNode) Lookup(ctx context.Context, name string, out *gofuse.EntryOut
 		Ino:  inodeFor(rel),
 	})
 	return child, 0
+}
+
+// --- NodeStatfser ---
+
+var _ fs.NodeStatfser = (*FuseNode)(nil)
+
+func (n *FuseNode) Statfs(ctx context.Context, out *gofuse.StatfsOut) syscall.Errno {
+	if quota, ok := n.root.quotaSnapshot(ctx); ok {
+		fillStatfsFromQuota(quota, out)
+		if out.Blocks > 0 {
+			return 0
+		}
+	}
+
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(n.root.cache.FilesDir(), &st); err != nil {
+		return toErrno(err)
+	}
+	fillStatfsFromSystem(&st, out)
+	return 0
 }
 
 // --- NodeGetattrer ---

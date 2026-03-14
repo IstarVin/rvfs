@@ -48,10 +48,13 @@ func (a *mockAdapter) GetRange(_ context.Context, _ string, _, _ int64, _ io.Wri
 func (a *mockAdapter) Put(_ context.Context, _ string, _ io.Reader, _ int64, _ time.Time) error {
 	return nil
 }
-func (a *mockAdapter) Delete(_ context.Context, _ string) error   { return nil }
-func (a *mockAdapter) Mkdir(_ context.Context, _ string) error    { return nil }
+func (a *mockAdapter) Delete(_ context.Context, _ string) error    { return nil }
+func (a *mockAdapter) Mkdir(_ context.Context, _ string) error     { return nil }
 func (a *mockAdapter) Rename(_ context.Context, _, _ string) error { return nil }
-func (a *mockAdapter) SupportsRange() bool                         { return false }
+func (a *mockAdapter) Quota(_ context.Context) (remote.QuotaInfo, error) {
+	return remote.QuotaInfo{}, nil
+}
+func (a *mockAdapter) SupportsRange() bool { return false }
 
 var errProbe = errors.New("probe: connection refused")
 
@@ -249,8 +252,8 @@ func TestSlowSubscriberDrop(t *testing.T) {
 	// then more failures → offline again.
 	adapter := &mockAdapter{probes: []error{
 		errProbe, errProbe, errProbe, // → offline
-		nil,                          // → reconnecting
-		errProbe,                     // → offline again (threshold=1 during reconnecting)
+		nil,      // → reconnecting
+		errProbe, // → offline again (threshold=1 during reconnecting)
 	}}
 	mon := connectivity.New(adapter, probeInterval, 3)
 	_ = mon.Subscribe() // intentionally never drained

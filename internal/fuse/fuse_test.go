@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/IstarVin/rvfs/internal/remote"
+	"github.com/IstarVin/rvfs/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,13 +20,17 @@ import (
 // mounts it, and registers cleanup (unmount + remove dirs) on t.
 // Returns the mountpoint path and the backing dir (for pre-seeding files).
 func mountForTest(t *testing.T) string {
+	return mountForTestWithOptions(t, rvfuse.MountOptions{})
+}
+
+func mountForTestWithOptions(t *testing.T, opts rvfuse.MountOptions) string {
 	t.Helper()
 
 	backingDir := t.TempDir()
 	cacheBase := t.TempDir()
 	mountpoint := t.TempDir()
 
-	cl, server, err := rvfuse.Mount(cacheBase, "test", mountpoint, rvfuse.MountOptions{})
+	cl, server, err := rvfuse.Mount(cacheBase, "test", mountpoint, opts)
 	require.NoError(t, err, "Mount")
 
 	// Seed the cache from the (empty) backing dir so the root dir entry exists.
@@ -41,6 +47,38 @@ func mountForTest(t *testing.T) string {
 	})
 
 	return mountpoint
+}
+
+func TestStatfsFallback(t *testing.T) {
+	t.Parallel()
+	mnt := mountForTest(t)
+
+	var st syscall.Statfs_t
+	require.NoError(t, syscall.Statfs(mnt, &st))
+	assert.Greater(t, st.Blocks, uint64(0))
+	assert.Greater(t, st.Bsize, int64(0))
+	assert.Greater(t, st.Namelen, int64(0))
+}
+
+func TestStatfsUsesRemoteQuota(t *testing.T) {
+	t.Parallel()
+
+	adapter := &testutil.MockRemoteAdapter{
+		QuotaResult: remote.QuotaInfo{
+			TotalBytes:     10 * 4096,
+			UsedBytes:      3 * 4096,
+			AvailableBytes: 7 * 4096,
+		},
+	}
+	mnt := mountForTestWithOptions(t, rvfuse.MountOptions{Adapter: adapter})
+
+	var st syscall.Statfs_t
+	require.NoError(t, syscall.Statfs(mnt, &st))
+	assert.Equal(t, uint64(10), st.Blocks)
+	assert.Equal(t, uint64(7), st.Bavail)
+	assert.Equal(t, uint64(7), st.Bfree)
+	assert.Equal(t, int64(4096), st.Bsize)
+	require.NoError(t, adapter.Verify("Quota"))
 }
 
 // TestCreateReadFile creates a file through the mount and reads it back.

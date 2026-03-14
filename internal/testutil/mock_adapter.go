@@ -56,6 +56,10 @@ type MockRemoteAdapter struct {
 	ProbeErrs []error // scripted sequence; exhausted → nil
 	probeIdx  int
 
+	QuotaFunc   func(ctx context.Context) (remote.QuotaInfo, error)
+	QuotaResult remote.QuotaInfo
+	QuotaErr    error
+
 	SupportsRangeVal bool
 }
 
@@ -183,6 +187,16 @@ func (m *MockRemoteAdapter) Probe(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (m *MockRemoteAdapter) Quota(ctx context.Context) (remote.QuotaInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.record("Quota")
+	if m.QuotaFunc != nil {
+		return m.QuotaFunc(ctx)
+	}
+	return m.QuotaResult, m.QuotaErr
 }
 
 func (m *MockRemoteAdapter) SupportsRange() bool {

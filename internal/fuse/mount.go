@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
@@ -61,7 +62,11 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 		return nil, nil, err
 	}
 
-	rootState := &RootState{cache: cl}
+	rootState := &RootState{
+		cache:    cl,
+		adapter:  opts.Adapter,
+		quotaTTL: 30 * time.Second,
+	}
 
 	if opts.DownloadManager != nil {
 		rootState.downloadMgr = opts.DownloadManager
@@ -79,6 +84,9 @@ func Mount(cacheBase, remoteID, mountpoint string, opts MountOptions) (*cache.Ca
 		rootState.syncEngine = opts.SyncEngine
 	}
 	rootState.verifyChecksums = opts.VerifyChecksums
+	if opts.Adapter != nil {
+		_, _ = rootState.quotaSnapshot(context.Background())
+	}
 
 	root := &FuseNode{
 		rel:  "",
