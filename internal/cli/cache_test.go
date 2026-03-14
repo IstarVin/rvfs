@@ -9,6 +9,7 @@ import (
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/config"
+	"github.com/IstarVin/rvfs/internal/ipc"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,12 +31,13 @@ func seedCacheFileWithState(t *testing.T, cl *cache.CacheLayer, cacheBase, remot
 	require.NoError(t, f.Close())
 
 	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
-		Path:       rel,
-		Size:       size,
-		Mode:       0100644,
-		State:      state,
-		Pinned:     pinned,
-		LastAccess: time.Now().Unix(),
+		Path:         rel,
+		Size:         size,
+		Mode:         0100644,
+		State:        state,
+		CachedRanges: "0-1",
+		Pinned:       pinned,
+		LastAccess:   time.Now().Unix(),
 	}))
 }
 
@@ -229,4 +231,91 @@ func TestCacheClean_ResetsRangesAndTransientMetadata(t *testing.T) {
 	assert.Equal(t, "", entry.CachedRanges)
 	assert.Equal(t, "", entry.SyncError)
 	assert.Equal(t, int64(0), entry.RetryAfter)
+}
+
+func TestCacheClean_ScopedToSourceDirectory(t *testing.T) {
+	prevCfg := globalCfg
+	prevInclude := cacheCleanIncludePinned
+	t.Cleanup(func() {
+		globalCfg = prevCfg
+		cacheCleanIncludePinned = prevInclude
+	})
+
+	cacheDir := t.TempDir()
+	globalCfg = &config.Config{Mount: config.MountConfig{CacheDir: cacheDir}}
+	cacheCleanIncludePinned = false
+
+	cl, err := cache.NewCacheLayer(cacheDir, "demo")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cl.Close() })
+
+	seedCacheFile(t, cl, cacheDir, "demo", "Videos/Drama/ep1.mkv", 16, false)
+	seedCacheFile(t, cl, cacheDir, "demo", "Videos/Other/ep2.mkv", 32, false)
+
+	cmd := &cobra.Command{}
+	err = cacheCleanCmd.RunE(cmd, []string{"demo:Videos/Drama"})
+	require.NoError(t, err)
+
+	drama, err := cl.DB().GetFile("Videos/Drama/ep1.mkv")
+	require.NoError(t, err)
+	require.NotNil(t, drama)
+	assert.Equal(t, cache.StateEvicted, drama.State)
+
+	other, err := cl.DB().GetFile("Videos/Other/ep2.mkv")
+	require.NoError(t, err)
+	require.NotNil(t, other)
+	assert.Equal(t, cache.StateClean, other.State)
+}
+
+func TestCacheClean_ScopedToMountPathDirectory(t *testing.T) {
+	prevCfg := globalCfg
+	prevInclude := cacheCleanIncludePinned
+	t.Cleanup(func() {
+		globalCfg = prevCfg
+		cacheCleanIncludePinned = prevInclude
+	})
+
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	cacheDir := t.TempDir()
+	globalCfg = &config.Config{Mount: config.MountConfig{CacheDir: cacheDir}}
+	cacheCleanIncludePinned = false
+
+	cl, err := cache.NewCacheLayer(cacheDir, "gdrive")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cl.Close() })
+
+	seedCacheFile(t, cl, cacheDir, "gdrive", "Videos/Drama/ep1.mkv", 16, false)
+	seedCacheFile(t, cl, cacheDir, "gdrive", "Videos/Other/ep2.mkv", 32, false)
+
+	mountpoint := filepath.Join(t.TempDir(), "mnt", "gdrive")
+	require.NoError(t, os.MkdirAll(filepath.Join(mountpoint, "Videos", "Drama"), 0755))
+
+	reg, err := ipc.OpenMountRegistry()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reg.Close() })
+
+	require.NoError(t, reg.Register(ipc.MountEntry{
+		Mountpoint: mountpoint,
+		Source:     "gdrive:",
+		RemoteName: "gdrive",
+		SockPath:   filepath.Join(runtimeDir, "rvfs", "gdrive.sock"),
+		PID:        os.Getpid(),
+		MountedAt:  time.Now().Unix(),
+	}))
+
+	cmd := &cobra.Command{}
+	err = cacheCleanCmd.RunE(cmd, []string{filepath.Join(mountpoint, "Videos", "Drama")})
+	require.NoError(t, err)
+
+	drama, err := cl.DB().GetFile("Videos/Drama/ep1.mkv")
+	require.NoError(t, err)
+	require.NotNil(t, drama)
+	assert.Equal(t, cache.StateEvicted, drama.State)
+
+	other, err := cl.DB().GetFile("Videos/Other/ep2.mkv")
+	require.NoError(t, err)
+	require.NotNil(t, other)
+	assert.Equal(t, cache.StateClean, other.State)
 }

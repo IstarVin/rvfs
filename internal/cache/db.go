@@ -734,20 +734,26 @@ func (m *MetadataDB) ListEvictable() ([]*FileEntry, error) {
 // from local cache via the CLI cleanup command. It includes files in clean,
 // downloading, or evicted states ordered by last_access ascending (least
 // recently accessed first). When includePinned is false, pinned entries are
-// excluded.
-func (m *MetadataDB) ListCleanupCandidates(includePinned bool) ([]*FileEntry, error) {
+// excluded. When relPrefix is non-empty, results are scoped to relPrefix
+// exactly and its descendants.
+func (m *MetadataDB) ListCleanupCandidates(includePinned bool, relPrefix string) ([]*FileEntry, error) {
 	query := `
 		SELECT path, is_dir, size, mode, remote_mtime, local_mtime,
 		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
 		       pinned, last_access
 		FROM files
 		WHERE cached_ranges != '' AND is_dir = 0`
+	args := []any{}
 	if !includePinned {
 		query += ` AND pinned = 0`
 	}
+	if relPrefix != "" {
+		query += ` AND (path = ? OR path LIKE ?)`
+		args = append(args, relPrefix, relPrefix+"/%")
+	}
 	query += ` ORDER BY last_access ASC`
 
-	rows, err := m.db.Query(query)
+	rows, err := m.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list cleanup candidates: %w", err)
 	}

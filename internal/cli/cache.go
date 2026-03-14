@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/IstarVin/rvfs/internal/cache"
@@ -20,18 +21,22 @@ var cacheCleanCmd = &cobra.Command{
 	Short: "Evict clean/downloading/evicted files from local cache",
 	Long: `Evict clean/downloading/evicted files from local cache for a source or active mount path.
 
+Optionally scope cleanup to a specific file or directory:
+  rvfs cache clean gdrive:PC/Videos/Drama
+  rvfs cache clean /mnt/gdrive/Videos/Drama
+
 By default pinned files are kept. Use --include-pinned to evict pinned
 clean/downloading/evicted files as well. Dirty/syncing/conflict files are never
 evicted by this command.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cl, target, err := resolveCacheTarget(args[0])
+		cl, target, relPrefix, err := resolveCacheTarget(args[0])
 		if err != nil {
 			return err
 		}
 		defer cl.Close()
 
-		entries, err := cl.DB().ListCleanupCandidates(cacheCleanIncludePinned)
+		entries, err := cl.DB().ListCleanupCandidates(cacheCleanIncludePinned, relPrefix)
 		if err != nil {
 			return fmt.Errorf("list cache cleanup candidates: %w", err)
 		}
@@ -66,19 +71,34 @@ evicted by this command.`,
 	},
 }
 
-func resolveCacheTarget(target string) (*cache.CacheLayer, string, error) {
+func resolveCacheTarget(target string) (*cache.CacheLayer, string, string, error) {
 	if strings.Contains(target, ":") {
+		_, relPath, _ := strings.Cut(target, ":")
 		_, _, cl, err := resolveSource(target)
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
-		return cl, target, nil
+		return cl, target, cleanRelPath(relPath), nil
 	}
-	_, _, cl, _, err := resolveMountPath(target)
+	_, _, cl, rel, err := resolveMountPath(target)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	return cl, target, nil
+	return cl, target, cleanRelPath(rel), nil
+}
+
+func cleanRelPath(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.ReplaceAll(p, "\\", "/")
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return ""
+	}
+	p = path.Clean(p)
+	if p == "." {
+		return ""
+	}
+	return strings.TrimPrefix(p, "./")
 }
 
 func init() {

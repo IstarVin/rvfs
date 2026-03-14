@@ -201,6 +201,45 @@ func TestListCleanFiles_IncludePinned(t *testing.T) {
 	assert.Equal(t, "unpinned.txt", got[1].Path)
 }
 
+func TestListCleanupCandidates_ScopedToDirectoryPrefix(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	entries := []*FileEntry{
+		{Path: "Videos/Drama/ep1.mkv", State: StateClean, Mode: 0100644, LastAccess: 10, CachedRanges: "0-10"},
+		{Path: "Videos/Drama/ep2.mkv", State: StateDownloading, Mode: 0100644, LastAccess: 20, CachedRanges: "0-10"},
+		{Path: "Videos/Other/movie.mkv", State: StateClean, Mode: 0100644, LastAccess: 30, CachedRanges: "0-10"},
+		{Path: "Videos/DramaPinned/ep3.mkv", State: StateClean, Mode: 0100644, LastAccess: 40, CachedRanges: "0-10"},
+	}
+	for _, e := range entries {
+		require.NoError(t, db.PutFile(e))
+	}
+
+	got, err := db.ListCleanupCandidates(false, "Videos/Drama")
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "Videos/Drama/ep1.mkv", got[0].Path)
+	assert.Equal(t, "Videos/Drama/ep2.mkv", got[1].Path)
+}
+
+func TestListCleanupCandidates_ScopedToExactFile(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	entries := []*FileEntry{
+		{Path: "Videos/Drama/ep1.mkv", State: StateClean, Mode: 0100644, LastAccess: 10, CachedRanges: "0-10"},
+		{Path: "Videos/Drama/ep2.mkv", State: StateClean, Mode: 0100644, LastAccess: 20, CachedRanges: "0-10"},
+	}
+	for _, e := range entries {
+		require.NoError(t, db.PutFile(e))
+	}
+
+	got, err := db.ListCleanupCandidates(false, "Videos/Drama/ep2.mkv")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "Videos/Drama/ep2.mkv", got[0].Path)
+}
+
 func TestDeleteFile(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)
