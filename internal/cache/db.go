@@ -780,7 +780,7 @@ func (m *MetadataDB) ListCleanupCandidates(includePinned bool, relPrefix string)
 		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
 		       pinned, last_access
 		FROM files
-		WHERE cached_ranges != '' AND is_dir = 0`
+		WHERE (cached_ranges != '' OR state IN ('downloading', 'clean')) AND is_dir = 0`
 	args := []any{}
 	if !includePinned {
 		query += ` AND pinned = 0`
