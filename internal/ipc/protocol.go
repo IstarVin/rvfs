@@ -7,12 +7,12 @@ package ipc
 
 // Request is sent by the client to the server.
 type Request struct {
-	// Cmd is the command name: "status", "sync", "prefetch", "evict", or "downloads".
+	// Cmd is the command name: "status", "sync", "prefetch", "evict", "downloads", or "uploads".
 	Cmd string `json:"cmd"`
 	// Force is used with Cmd=="sync" to clear all retry_after timers first.
 	Force bool `json:"force,omitempty"`
-	// Path is used with Cmd=="prefetch", "evict", or "downloads".
-	// For "downloads", an empty path means "list active downloads".
+	// Path is used with Cmd=="prefetch", "evict", "downloads", or "uploads".
+	// For "downloads" and "uploads", an empty path means "list active transfers".
 	Path string `json:"path,omitempty"`
 	// Sequential is used with Cmd=="prefetch" to request queue-based,
 	// one-at-a-time processing for directory pin workflows.
@@ -68,6 +68,22 @@ type DownloadStatusEntry struct {
 // DownloadStatusResponse is the server's reply to a "downloads" request.
 type DownloadStatusResponse struct {
 	Entries []DownloadStatusEntry `json:"entries"`
+}
+
+// UploadStatusEntry describes one path's active upload state.
+type UploadStatusEntry struct {
+	Path      string `json:"path"`
+	State     string `json:"state"`
+	Uploaded  int64  `json:"uploaded"`
+	TotalSize int64  `json:"total_size"`
+	StartedAt int64  `json:"started_at,omitempty"`
+	Done      bool   `json:"done"`
+	Err       string `json:"err,omitempty"`
+}
+
+// UploadStatusResponse is the server's reply to an "uploads" request.
+type UploadStatusResponse struct {
+	Entries []UploadStatusEntry `json:"entries"`
 }
 
 // SockPath returns the UNIX socket path for a given remoteID.

@@ -3,8 +3,10 @@ package sync
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,8 +35,29 @@ type Engine struct {
 
 	// uploadCtxs tracks cancellation functions for uploads in flight.
 	// Keyed by file path; used by CancelUpload to abort an ongoing Put.
-	uploadMu   sync.Mutex
-	uploadCtxs map[string]context.CancelFunc
+	uploadMu       sync.Mutex
+	uploadCtxs     map[string]context.CancelFunc
+	uploadProgress map[string]*uploadState
+}
+
+// UploadProgress is a snapshot of one active upload.
+type UploadProgress struct {
+	Path      string
+	State     string
+	Uploaded  int64
+	TotalSize int64
+	StartedAt int64
+	Done      bool
+	Err       string
+}
+
+type uploadState struct {
+	path      string
+	totalSize int64
+	uploaded  int64
+	startedAt int64
+	done      bool
+	err       string
 }
 
 // NewEngine creates a sync engine. monitor may be nil for local mounts or
@@ -46,13 +69,14 @@ func NewEngine(adapter remote.RemoteAdapter, cl *cache.CacheLayer, interval time
 		strategy = StrategyBoth
 	}
 	e := &Engine{
-		adapter:    adapter,
-		cache:      cl,
-		interval:   interval,
-		monitor:    monitor,
-		stopCh:     make(chan struct{}),
-		doneCh:     make(chan struct{}),
-		uploadCtxs: make(map[string]context.CancelFunc),
+		adapter:        adapter,
+		cache:          cl,
+		interval:       interval,
+		monitor:        monitor,
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+		uploadCtxs:     make(map[string]context.CancelFunc),
+		uploadProgress: make(map[string]*uploadState),
 	}
 	if adapter != nil {
 		e.resolver = NewResolver(strategy, cl, adapter)
@@ -158,6 +182,101 @@ func (e *Engine) monitorCtx() context.Context {
 	return context.Background()
 }
 
+// UploadSnapshots returns active upload progress. If path is non-empty, at
+// most one entry is returned.
+func (e *Engine) UploadSnapshots(path string) []UploadProgress {
+	e.uploadMu.Lock()
+	defer e.uploadMu.Unlock()
+
+	out := make([]UploadProgress, 0, len(e.uploadProgress))
+	if path != "" {
+		state, ok := e.uploadProgress[path]
+		if !ok {
+			return out
+		}
+		return []UploadProgress{uploadSnapshot(state)}
+	}
+
+	for _, state := range e.uploadProgress {
+		out = append(out, uploadSnapshot(state))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+func uploadSnapshot(state *uploadState) UploadProgress {
+	p := UploadProgress{
+		Path:      state.path,
+		Uploaded:  state.uploaded,
+		TotalSize: state.totalSize,
+		StartedAt: state.startedAt,
+		Done:      state.done,
+	}
+	switch {
+	case state.done:
+		p.State = "complete"
+	case state.err != "":
+		p.State = "error"
+		p.Err = state.err
+	default:
+		p.State = "uploading"
+	}
+	return p
+}
+
+func (e *Engine) startUpload(path string, totalSize int64) {
+	e.uploadMu.Lock()
+	e.uploadProgress[path] = &uploadState{
+		path:      path,
+		totalSize: totalSize,
+		startedAt: time.Now().Unix(),
+	}
+	e.uploadMu.Unlock()
+}
+
+func (e *Engine) advanceUpload(path string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	e.uploadMu.Lock()
+	if state, ok := e.uploadProgress[path]; ok {
+		state.uploaded += delta
+		if state.totalSize > 0 && state.uploaded > state.totalSize {
+			state.uploaded = state.totalSize
+		}
+	}
+	e.uploadMu.Unlock()
+}
+
+func (e *Engine) finishUpload(path string, err error) {
+	e.uploadMu.Lock()
+	defer e.uploadMu.Unlock()
+	state, ok := e.uploadProgress[path]
+	if !ok {
+		return
+	}
+	if err != nil {
+		state.err = err.Error()
+	} else {
+		state.done = true
+		state.uploaded = state.totalSize
+	}
+	delete(e.uploadProgress, path)
+}
+
+type countingReader struct {
+	reader io.Reader
+	onRead func(int64)
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(int64(n))
+	}
+	return n, err
+}
+
 // ---------- Upload ----------
 
 func (e *Engine) uploadDirty() {
@@ -219,8 +338,19 @@ func (e *Engine) uploadFile(entry *cache.FileEntry) {
 		cancel()
 	}()
 
+	e.startUpload(entry.Path, entry.Size)
+	defer func() {
+		e.finishUpload(entry.Path, err)
+	}()
+
 	mtime := time.Unix(entry.LocalMtime, 0)
-	if err := e.adapter.Put(ctx, entry.Path, f, entry.Size, mtime); err != nil {
+	uploadReader := &countingReader{
+		reader: f,
+		onRead: func(n int64) {
+			e.advanceUpload(entry.Path, n)
+		},
+	}
+	if err = e.adapter.Put(ctx, entry.Path, uploadReader, entry.Size, mtime); err != nil {
 		// Revert to dirty on failure.
 		if dbErr := e.cache.DB().SetState(entry.Path, cache.StateDirty); dbErr != nil {
 			slog.Warn("sync: revert to dirty failed", "path", entry.Path, "err", dbErr)

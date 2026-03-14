@@ -371,6 +371,25 @@ func (m *MetadataDB) DeleteFile(path string) error {
 
 // AddPendingOp inserts a new pending operation.
 func (m *MetadataDB) AddPendingOp(op *PendingOp) error {
+	if op.Op == "put" {
+		var existingID int64
+		err := m.db.QueryRow(`SELECT id FROM pending_ops WHERE op = 'put' AND path = ? ORDER BY id LIMIT 1`, op.Path).Scan(&existingID)
+		switch err {
+		case nil:
+			_, err = m.db.Exec(`
+				UPDATE pending_ops
+				SET queued_at = ?, attempts = 0, last_error = '', dest_path = ''
+				WHERE id = ?`,
+				op.QueuedAt, existingID)
+			if err != nil {
+				return fmt.Errorf("refresh pending put: %w", err)
+			}
+			return nil
+		case sql.ErrNoRows:
+		default:
+			return fmt.Errorf("lookup pending put: %w", err)
+		}
+	}
 	_, err := m.db.Exec(`
 		INSERT INTO pending_ops (op, path, dest_path, queued_at, attempts, last_error)
 		VALUES (?, ?, ?, ?, ?, ?)`,
@@ -383,6 +402,25 @@ func (m *MetadataDB) AddPendingOp(op *PendingOp) error {
 
 // AddPendingOpTx inserts a new pending operation inside an existing transaction.
 func (m *MetadataDB) AddPendingOpTx(tx *sql.Tx, op *PendingOp) error {
+	if op.Op == "put" {
+		var existingID int64
+		err := tx.QueryRow(`SELECT id FROM pending_ops WHERE op = 'put' AND path = ? ORDER BY id LIMIT 1`, op.Path).Scan(&existingID)
+		switch err {
+		case nil:
+			_, err = tx.Exec(`
+				UPDATE pending_ops
+				SET queued_at = ?, attempts = 0, last_error = '', dest_path = ''
+				WHERE id = ?`,
+				op.QueuedAt, existingID)
+			if err != nil {
+				return fmt.Errorf("refresh pending put tx: %w", err)
+			}
+			return nil
+		case sql.ErrNoRows:
+		default:
+			return fmt.Errorf("lookup pending put tx: %w", err)
+		}
+	}
 	_, err := tx.Exec(`
 		INSERT INTO pending_ops (op, path, dest_path, queued_at, attempts, last_error)
 		VALUES (?, ?, ?, ?, ?, ?)`,

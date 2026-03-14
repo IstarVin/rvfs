@@ -341,6 +341,35 @@ func TestPendingOpsLimit(t *testing.T) {
 	assert.Len(t, got, 2)
 }
 
+func TestPendingOpsCoalesceDuplicatePut(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+
+	firstQueuedAt := time.Now().Add(-time.Minute).Unix()
+	secondQueuedAt := time.Now().Unix()
+	require.NoError(t, db.AddPendingOp(&PendingOp{
+		Op:        "put",
+		Path:      "dup.txt",
+		QueuedAt:  firstQueuedAt,
+		Attempts:  3,
+		LastError: "temporary failure",
+	}))
+	require.NoError(t, db.AddPendingOp(&PendingOp{
+		Op:       "put",
+		Path:     "dup.txt",
+		QueuedAt: secondQueuedAt,
+	}))
+
+	ops, err := db.NextPendingOps(10)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, "put", ops[0].Op)
+	assert.Equal(t, "dup.txt", ops[0].Path)
+	assert.Equal(t, secondQueuedAt, ops[0].QueuedAt)
+	assert.Zero(t, ops[0].Attempts)
+	assert.Empty(t, ops[0].LastError)
+}
+
 // ---------- HasFiles ----------
 
 func TestHasFilesEmpty(t *testing.T) {

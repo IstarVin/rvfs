@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -184,4 +185,43 @@ func TestConcurrentReadMultipleEvictedFiles(t *testing.T) {
 		require.Equal(t, syscall.Errno(0), errnos[i], "file %s", p)
 		assert.Equal(t, contentFor(p), results[i], "content mismatch for %s", p)
 	}
+}
+
+func TestFileHandleWriteUpdatesDBSize(t *testing.T) {
+	t.Parallel()
+
+	cl, err := cache.NewCacheLayer(t.TempDir(), "test-remote")
+	require.NoError(t, err)
+	t.Cleanup(func() { cl.Close() })
+
+	f, _, err := cl.Create("write-size.txt", 0644)
+	require.NoError(t, err)
+
+	fh := &fileHandle{
+		f:   f,
+		rel: "write-size.txt",
+		root: &RootState{
+			cache: cl,
+		},
+	}
+
+	written, errno := fh.Write(context.Background(), []byte("hello world"), 0)
+	require.Equal(t, syscall.Errno(0), errno)
+	require.Equal(t, uint32(len("hello world")), written)
+	require.Equal(t, syscall.Errno(0), fh.Release(context.Background()))
+
+	entry, err := cl.DB().GetFile("write-size.txt")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, int64(len("hello world")), entry.Size)
+	assert.Equal(t, cache.StateDirty, entry.State)
+
+	info, err := os.Stat(cl.DiskPath("write-size.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, info.Size(), entry.Size)
+	ops, err := cl.DB().NextPendingOps(10)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, "put", ops[0].Op)
+	assert.Equal(t, "write-size.txt", ops[0].Path)
 }

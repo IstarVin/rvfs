@@ -197,7 +197,8 @@ func TestCachePendingOpsChronological(t *testing.T) {
 	t.Parallel()
 	cl := newTestCache(t)
 
-	// Create, then write, then rename — ops should be in order.
+	// Create, then write, then rename — repeated puts should coalesce so the
+	// queue keeps one upload entry followed by the rename.
 	f, _, _ := cl.Create("seq.txt", 0644)
 	f.Close()
 	cl.Write("seq.txt", []byte("data"), 0)
@@ -205,15 +206,35 @@ func TestCachePendingOpsChronological(t *testing.T) {
 
 	ops, err := cl.DB().NextPendingOps(10)
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, len(ops), 3)
+	require.Len(t, ops, 2)
 
-	// Verify chronological: create(put) -> write(put) -> rename
+	// Verify chronological: put -> rename
 	assert.Equal(t, "put", ops[0].Op)
-	assert.Equal(t, "rename", ops[len(ops)-1].Op)
+	assert.Equal(t, "rename", ops[1].Op)
 	// IDs should be strictly increasing.
 	for i := 1; i < len(ops); i++ {
 		assert.Greater(t, ops[i].ID, ops[i-1].ID, "ops not in order at index %d", i)
 	}
+}
+
+func TestCacheWriteCoalescesPendingPut(t *testing.T) {
+	t.Parallel()
+	cl := newTestCache(t)
+
+	f, _, err := cl.Create("coalesce.txt", 0644)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, err = cl.Write("coalesce.txt", []byte("first"), 0)
+	require.NoError(t, err)
+	_, err = cl.Write("coalesce.txt", []byte("second"), 0)
+	require.NoError(t, err)
+
+	ops, err := cl.DB().NextPendingOps(10)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, "put", ops[0].Op)
+	assert.Equal(t, "coalesce.txt", ops[0].Path)
 }
 
 // ---------- Extended tests ----------

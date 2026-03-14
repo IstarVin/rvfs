@@ -738,6 +738,27 @@ func (h *mountHandler) HandleDownloads(path string) (ipc.DownloadStatusResponse,
 	return resp, nil
 }
 
+func (h *mountHandler) HandleUploads(path string) (ipc.UploadStatusResponse, error) {
+	resp := ipc.UploadStatusResponse{Entries: []ipc.UploadStatusEntry{}}
+	if h.engine == nil {
+		return resp, nil
+	}
+
+	for _, s := range h.engine.UploadSnapshots(path) {
+		resp.Entries = append(resp.Entries, ipc.UploadStatusEntry{
+			Path:      s.Path,
+			State:     s.State,
+			Uploaded:  s.Uploaded,
+			TotalSize: s.TotalSize,
+			StartedAt: s.StartedAt,
+			Done:      s.Done,
+			Err:       s.Err,
+		})
+	}
+
+	return resp, nil
+}
+
 // durationValue is a pflag.Value that parses Go duration strings
 // case-insensitively, so "3H" is treated the same as "3h".
 type durationValue time.Duration

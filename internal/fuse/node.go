@@ -537,6 +537,9 @@ func (fh *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32
 	if err != nil {
 		return uint32(n), toErrno(err)
 	}
+	if err := fh.root.cache.SyncWrittenFile(fh.rel, fh.f); err != nil {
+		return uint32(n), toErrno(err)
+	}
 	return uint32(n), 0
 }
 

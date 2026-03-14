@@ -26,6 +26,8 @@ type mockHandler struct {
 	evictErr      error
 	downloadsResp DownloadStatusResponse
 	downloadsErr  error
+	uploadsResp   UploadStatusResponse
+	uploadsErr    error
 	lastPath      string
 }
 
@@ -62,6 +64,13 @@ func (m *mockHandler) HandleDownloads(path string) (DownloadStatusResponse, erro
 	defer m.mu.Unlock()
 	m.lastPath = path
 	return m.downloadsResp, m.downloadsErr
+}
+
+func (m *mockHandler) HandleUploads(path string) (UploadStatusResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastPath = path
+	return m.uploadsResp, m.uploadsErr
 }
 
 // startTestServer starts a Server with the given handler, registers cleanup,
@@ -256,6 +265,43 @@ func TestServerDownloadsError(t *testing.T) {
 	defer c.Close()
 
 	_, err = c.Downloads("docs/a.txt")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db unavailable")
+}
+
+func TestServerUploadsHappyPath(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{uploadsResp: UploadStatusResponse{Entries: []UploadStatusEntry{{
+		Path:      "docs/a.txt",
+		State:     "uploading",
+		Uploaded:  5,
+		TotalSize: 10,
+	}}}}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	resp, err := c.Uploads("docs/a.txt")
+	require.NoError(t, err)
+	require.Len(t, resp.Entries, 1)
+	assert.Equal(t, "docs/a.txt", resp.Entries[0].Path)
+	h.mu.Lock()
+	assert.Equal(t, "docs/a.txt", h.lastPath)
+	h.mu.Unlock()
+}
+
+func TestServerUploadsError(t *testing.T) {
+	t.Parallel()
+	h := &mockHandler{uploadsErr: errors.New("db unavailable")}
+	sockPath := startTestServer(t, h)
+
+	c, err := Dial(sockPath)
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = c.Uploads("docs/a.txt")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "db unavailable")
 }

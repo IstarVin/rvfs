@@ -139,6 +139,52 @@ func (c *CacheLayer) Write(rel string, data []byte, off int64) (int, error) {
 	return n, tx.Commit()
 }
 
+// SyncWrittenFile refreshes the DB metadata for rel from an open file handle,
+// marks the entry dirty, and queues a put operation.
+func (c *CacheLayer) SyncWrittenFile(rel string, f *os.File) error {
+	if f == nil {
+		return fmt.Errorf("sync written file %q: nil file", rel)
+	}
+
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return err
+	}
+
+	now := time.Now().Unix()
+	tx, err := c.db.BeginTx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	existing, err := c.db.GetFile(rel)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		existing = &FileEntry{Path: rel}
+	}
+	existing.IsDir = st.Mode&syscall.S_IFMT == syscall.S_IFDIR
+	existing.Size = st.Size
+	existing.Mode = st.Mode
+	existing.LocalMtime = now
+	existing.CachePath = c.diskPath(rel)
+	existing.State = StateDirty
+
+	if err := c.db.PutFileTx(tx, existing); err != nil {
+		return err
+	}
+	if err := c.db.AddPendingOpTx(tx, &PendingOp{
+		Op:       "put",
+		Path:     rel,
+		QueuedAt: now,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // Create creates a new file in the cache, inserts a dirty DB entry, and
 // queues a put operation. Returns the open file handle and the FileEntry.
 func (c *CacheLayer) Create(rel string, mode uint32) (*os.File, *FileEntry, error) {

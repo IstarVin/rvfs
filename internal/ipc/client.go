@@ -125,6 +125,23 @@ func (c *Client) Downloads(path string) (DownloadStatusResponse, error) {
 	return resp, nil
 }
 
+// Uploads sends an "uploads" request and returns current active upload entries.
+// path=="" means list all active uploads.
+func (c *Client) Uploads(path string) (UploadStatusResponse, error) {
+	if err := c.enc.Encode(Request{Cmd: "uploads", Path: path}); err != nil {
+		return UploadStatusResponse{}, fmt.Errorf("ipc: send uploads: %w", err)
+	}
+	raw, err := c.readRaw("uploads")
+	if err != nil {
+		return UploadStatusResponse{}, err
+	}
+	var resp UploadStatusResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return UploadStatusResponse{}, fmt.Errorf("ipc: decode uploads response: %w", err)
+	}
+	return resp, nil
+}
+
 func (c *Client) readRaw(cmd string) ([]byte, error) {
 	if !c.scan.Scan() {
 		if err := c.scan.Err(); err != nil {

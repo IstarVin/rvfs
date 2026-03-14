@@ -25,6 +25,9 @@ type Handler interface {
 	// HandleDownloads returns download/cache status for path, or all active
 	// downloads when path is empty.
 	HandleDownloads(path string) (DownloadStatusResponse, error)
+	// HandleUploads returns active upload status for path, or all active
+	// uploads when path is empty.
+	HandleUploads(path string) (UploadStatusResponse, error)
 }
 
 // Server listens on a UNIX socket and dispatches incoming requests to a Handler.
@@ -132,6 +135,13 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		case "downloads":
 			resp, err := s.handler.HandleDownloads(req.Path)
+			if err != nil {
+				_ = enc.Encode(map[string]string{"error": err.Error()})
+			} else {
+				_ = enc.Encode(resp)
+			}
+		case "uploads":
+			resp, err := s.handler.HandleUploads(req.Path)
 			if err != nil {
 				_ = enc.Encode(map[string]string{"error": err.Error()})
 			} else {

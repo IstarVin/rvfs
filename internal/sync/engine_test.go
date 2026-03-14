@@ -148,6 +148,79 @@ func TestUploadDirtyFailure(t *testing.T) {
 	assert.Contains(t, got.SyncError, "upload failed")
 }
 
+func TestUploadSnapshotsProgress(t *testing.T) {
+	t.Parallel()
+	uploadStarted := make(chan struct{})
+	continueUpload := make(chan struct{})
+
+	adapter := &testutil.MockRemoteAdapter{
+		ListItems: []remote.FileInfo{},
+		PutFunc: func(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error {
+			buf := make([]byte, 4)
+			n, err := src.Read(buf)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return err
+			}
+			if n > 0 {
+				close(uploadStarted)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-continueUpload:
+			}
+			_, err = io.Copy(io.Discard, src)
+			return err
+		},
+	}
+	e, cl := newTestEngine(t, adapter, StrategyBoth)
+
+	f, _, err := cl.Create("progress.txt", 0644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("12345678"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	entry, err := cl.DB().GetFile("progress.txt")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	entry.Size = 8
+	require.NoError(t, cl.DB().PutFile(entry))
+
+	done := make(chan struct{})
+	go func() {
+		e.uploadDirty()
+		close(done)
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not start in time")
+	}
+
+	snapshots := e.UploadSnapshots("progress.txt")
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "progress.txt", snapshots[0].Path)
+	assert.Equal(t, "uploading", snapshots[0].State)
+	assert.Equal(t, int64(4), snapshots[0].Uploaded)
+	assert.Equal(t, int64(8), snapshots[0].TotalSize)
+	assert.NotZero(t, snapshots[0].StartedAt)
+
+	close(continueUpload)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not finish in time")
+	}
+
+	require.Empty(t, e.UploadSnapshots("progress.txt"))
+	entry, err = cl.DB().GetFile("progress.txt")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, cache.StateClean, entry.State)
+}
+
 // ---------- processPendingOps ----------
 
 func TestProcessPendingOps(t *testing.T) {
@@ -572,6 +645,7 @@ func TestCancelUpload(t *testing.T) {
 	got, err := cl.DB().GetFile("cancel.txt")
 	require.NoError(t, err)
 	assert.Equal(t, cache.StateDirty, got.State)
+	require.Empty(t, e.UploadSnapshots("cancel.txt"))
 }
 
 func TestPullSameRemoteMtime_NoChange(t *testing.T) {
