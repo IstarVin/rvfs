@@ -110,8 +110,9 @@ type Download struct {
 	err         error // first fatal error
 	done        bool
 
-	// goroutines maps startOffset → (cancel func, current position).
+	// goroutines maps a unique goroutine ID → (cancel func, current position).
 	goroutines map[int64]*goroutineInfo
+	nextGID    int64 // next goroutine ID; incremented under dl.mu
 	mgr        *Manager
 
 	// Periodic persistence state.
@@ -203,6 +204,9 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 	_ = m.cache.DB().SetState(path, cache.StateDownloading)
 
 	// Spawn sequential download goroutine from the first gap.
+	// Hold dl.mu so that concurrent waitForRange callers (who can now
+	// find dl in m.downloads) don't race on dl.goroutines.
+	dl.mu.Lock()
 	seqStart := int64(0)
 	if gaps := dl.rangeSet.Gaps(totalSize); len(gaps) > 0 {
 		seqStart = gaps[0].Start
@@ -214,6 +218,7 @@ func (m *Manager) Start(path string, totalSize int64) (*Download, *os.File, erro
 		dl.done = true
 		go dl.finish()
 	}
+	dl.mu.Unlock()
 
 	readFile, err := m.cache.Open(path, os.O_RDONLY)
 	if err != nil {
@@ -480,6 +485,11 @@ func (dl *Download) waitForRange(offset, size int64) error {
 
 	// Wait until the range is covered, an error occurs, or the download finishes.
 	for !dl.rangeSet.Contains(offset, size) && dl.err == nil && !dl.done {
+		// If all goroutines have exited (e.g. idle timeout, goroutine map
+		// collision cleanup), restart one so the download makes progress.
+		if len(dl.goroutines) == 0 {
+			dl.spawnGoroutine(offset, true)
+		}
 		dl.cond.Wait()
 	}
 
@@ -519,37 +529,40 @@ func (dl *Download) cancelFarBehind(offset int64) {
 }
 
 func (dl *Download) spawnGoroutine(startOffset int64, isSequential bool) {
+	dl.nextGID++
+	id := dl.nextGID
 	doneCh := make(chan struct{})
 	gi := &goroutineInfo{
 		cancel:       sync.OnceFunc(func() { close(doneCh) }),
 		pos:          startOffset,
 		isSequential: isSequential,
 	}
-	dl.goroutines[startOffset] = gi
+	dl.goroutines[id] = gi
 
-	go dl.downloadLoop(startOffset, isSequential, doneCh, gi)
+	go dl.downloadLoop(id, startOffset, isSequential, doneCh, gi)
 }
 
-func (dl *Download) downloadLoop(startOffset int64, isSequential bool, doneCh chan struct{}, gi *goroutineInfo) {
+func (dl *Download) downloadLoop(id int64, startOffset int64, isSequential bool, doneCh chan struct{}, gi *goroutineInfo) {
 	defer func() {
 		dl.mu.Lock()
-		delete(dl.goroutines, startOffset)
+		delete(dl.goroutines, id)
 		remaining := len(dl.goroutines)
 		if remaining == 0 && dl.rangeSet.IsComplete(dl.totalSize) && !dl.done {
 			dl.done = true
-			dl.cond.Broadcast()
 			go dl.finish()
 		} else if remaining == 0 && dl.err != nil && !dl.done {
 			// All goroutines have exited due to error — remove from manager map
 			// so future Start() calls can retry the download.
 			dl.done = true
-			dl.cond.Broadcast()
 			go func() {
 				dl.mgr.mu.Lock()
 				delete(dl.mgr.downloads, dl.path)
 				dl.mgr.mu.Unlock()
 			}()
 		}
+		// Always broadcast so waiters in waitForRange can re-evaluate
+		// and potentially respawn goroutines.
+		dl.cond.Broadcast()
 		dl.mu.Unlock()
 	}()
 

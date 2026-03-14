@@ -2,12 +2,15 @@ package fuse_test
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
 
+	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/remote"
 	"github.com/IstarVin/rvfs/internal/testutil"
 	"github.com/stretchr/testify/assert"
@@ -24,6 +27,11 @@ func mountForTest(t *testing.T) string {
 }
 
 func mountForTestWithOptions(t *testing.T, opts rvfuse.MountOptions) string {
+	mnt, _ := mountForTestWithCL(t, opts)
+	return mnt
+}
+
+func mountForTestWithCL(t *testing.T, opts rvfuse.MountOptions) (string, *cache.CacheLayer) {
 	t.Helper()
 
 	backingDir := t.TempDir()
@@ -46,7 +54,7 @@ func mountForTestWithOptions(t *testing.T, opts rvfuse.MountOptions) string {
 		cl.Close()
 	})
 
-	return mountpoint
+	return mountpoint, cl
 }
 
 func TestStatfsFallback(t *testing.T) {
@@ -310,4 +318,55 @@ func TestConcurrentWritesSameFile(t *testing.T) {
 	require.Len(t, got, half*2)
 	assert.Equal(t, aData, got[:half], "first half should be all A")
 	assert.Equal(t, bData, got[half:], "second half should be all B")
+}
+
+// TestConcurrentReadEvictedFilesThroughMount reads multiple evicted files
+// concurrently through a live FUSE mount, verifying end-to-end concurrent
+// lazy-download support.
+func TestConcurrentReadEvictedFilesThroughMount(t *testing.T) {
+	t.Parallel()
+
+	const fileSize = 256
+	contentFor := func(path string) []byte {
+		return bytes.Repeat([]byte{path[0]}, fileSize)
+	}
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+			_, err := dest.Write(contentFor(path))
+			return err
+		},
+	}
+
+	mnt, cl := mountForTestWithCL(t, rvfuse.MountOptions{Adapter: adapter})
+
+	paths := []string{"x.bin", "y.bin", "z.bin"}
+	for _, p := range paths {
+		require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+			Path:  p,
+			State: cache.StateEvicted,
+			Mode:  0100644,
+			Size:  int64(fileSize),
+		}))
+	}
+
+	var wg sync.WaitGroup
+	results := make([][]byte, len(paths))
+	errs := make([]error, len(paths))
+
+	for i, p := range paths {
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			data, err := os.ReadFile(filepath.Join(mnt, p))
+			results[i] = data
+			errs[i] = err
+		}(i, p)
+	}
+	wg.Wait()
+
+	for i, p := range paths {
+		require.NoError(t, errs[i], "reading %s", p)
+		assert.Equal(t, contentFor(p), results[i], "content mismatch for %s", p)
+	}
 }

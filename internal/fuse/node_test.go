@@ -1,9 +1,11 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -120,4 +122,66 @@ func TestReadEvictedOfflineFailsAtReadNotOpen(t *testing.T) {
 	assert.Len(t, adapter.CallsFor("Get"), 0, "offline read should not call remote Get")
 
 	require.Equal(t, syscall.Errno(0), dh.Release(context.Background()))
+}
+
+func TestConcurrentReadMultipleEvictedFiles(t *testing.T) {
+	t.Parallel()
+
+	const fileSize = 256
+	contentFor := func(path string) []byte {
+		return bytes.Repeat([]byte{path[0]}, fileSize)
+	}
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+			_, err := dest.Write(contentFor(path))
+			return err
+		},
+	}
+
+	cl, err := cache.NewCacheLayer(t.TempDir(), "test-remote")
+	require.NoError(t, err)
+	t.Cleanup(func() { cl.Close() })
+
+	mgr := download.NewManager(adapter, cl, nil, download.ManagerOptions{})
+	rootState := &RootState{cache: cl, downloadMgr: mgr}
+
+	paths := []string{"a.bin", "b.bin", "c.bin"}
+	for _, p := range paths {
+		require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+			Path:  p,
+			State: cache.StateEvicted,
+			Mode:  0100644,
+			Size:  fileSize,
+		}))
+	}
+
+	var wg sync.WaitGroup
+	results := make([][]byte, len(paths))
+	errnos := make([]syscall.Errno, len(paths))
+
+	for i, p := range paths {
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			node := &FuseNode{rel: p, root: rootState}
+			fh, _, errno := node.Open(context.Background(), 0)
+			if errno != 0 {
+				errnos[i] = errno
+				return
+			}
+			dh := fh.(*downloadFileHandle)
+			dest := make([]byte, fileSize)
+			_, readErrno := dh.Read(context.Background(), dest, 0)
+			errnos[i] = readErrno
+			results[i] = dest
+			dh.Release(context.Background())
+		}(i, p)
+	}
+	wg.Wait()
+
+	for i, p := range paths {
+		require.Equal(t, syscall.Errno(0), errnos[i], "file %s", p)
+		assert.Equal(t, contentFor(p), results[i], "content mismatch for %s", p)
+	}
 }

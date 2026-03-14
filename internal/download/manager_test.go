@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,11 +62,10 @@ func TestManagerStartDedup(t *testing.T) {
 	// Use a blocking Get so the download stays in-progress.
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
 			close(started)
-			// Block until test ends.
-			<-make(chan struct{})
-			return nil
+			<-ctx.Done()
+			return ctx.Err()
 		},
 	}
 	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
@@ -92,10 +95,10 @@ func TestManagerIsDownloading(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
 			close(started)
-			<-make(chan struct{})
-			return nil
+			<-ctx.Done()
+			return ctx.Err()
 		},
 	}
 	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
@@ -123,10 +126,10 @@ func TestManagerCancel(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
 			close(started)
-			<-make(chan struct{})
-			return nil
+			<-ctx.Done()
+			return ctx.Err()
 		},
 	}
 	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
@@ -224,10 +227,10 @@ func TestManagerConcurrentStarts(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	adapter := &testutil.MockRemoteAdapter{
-		GetFunc: func(_ context.Context, path string, dest io.Writer) error {
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
 			close(started)
-			<-make(chan struct{})
-			return nil
+			<-ctx.Done()
+			return ctx.Err()
 		},
 	}
 	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
@@ -763,4 +766,106 @@ func TestManagerSeekRedirectsDownload(t *testing.T) {
 	}
 
 	mgr.Cancel("seek.bin")
+}
+
+func TestManagerConcurrentMultiFileDownload(t *testing.T) {
+	t.Parallel()
+
+	const fileCount = 5
+	const fileSize = 1024
+
+	contentFor := func(name string) []byte {
+		return bytes.Repeat([]byte{name[0]}, fileSize)
+	}
+
+	var active, peak atomic.Int32
+	var startCount atomic.Int32
+	allStarted := make(chan struct{})
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			cur := active.Add(1)
+			defer active.Add(-1)
+
+			for {
+				prev := peak.Load()
+				if cur <= prev || peak.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+
+			if startCount.Add(1) == int32(fileCount) {
+				close(allStarted)
+			}
+			select {
+			case <-allStarted:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+
+			_, err := dest.Write(contentFor(path))
+			return err
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+
+	names := make([]string, fileCount)
+	for i := range fileCount {
+		names[i] = fmt.Sprintf("f%d.bin", i)
+		require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+			Path:  names[i],
+			State: cache.StateEvicted,
+			Mode:  0100644,
+			Size:  fileSize,
+		}))
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, fileCount)
+	files := make([]*os.File, fileCount)
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			dl, f, err := mgr.Start(name, fileSize)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			files[i] = f
+			errs[i] = dl.WaitForRange(0, fileSize)
+		}(i, name)
+	}
+	wg.Wait()
+
+	for i := range errs {
+		require.NoError(t, errs[i], "download %d", i)
+	}
+	for _, f := range files {
+		if f != nil {
+			f.Close()
+		}
+	}
+
+	assert.GreaterOrEqual(t, peak.Load(), int32(fileCount),
+		"all %d downloads should have been active simultaneously", fileCount)
+
+	require.Eventually(t, func() bool {
+		for _, n := range names {
+			if mgr.IsDownloading(n) {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 10*time.Millisecond)
+
+	for _, name := range names {
+		f, err := cl.Open(name, os.O_RDONLY)
+		require.NoError(t, err)
+		buf := make([]byte, fileSize)
+		n, _ := f.ReadAt(buf, 0)
+		f.Close()
+		assert.Equal(t, contentFor(name), buf[:n], "content mismatch for %s", name)
+	}
 }

@@ -18,6 +18,9 @@ type Call struct {
 
 // MockRemoteAdapter implements remote.RemoteAdapter with configurable
 // per-method behaviour and call recording for test verification.
+//
+// IMPORTANT: Callbacks (e.g. GetFunc) are invoked **outside** the mutex so
+// that blocking callbacks do not deadlock concurrent mock calls.
 type MockRemoteAdapter struct {
 	mu    sync.Mutex
 	calls []Call
@@ -91,112 +94,150 @@ func (m *MockRemoteAdapter) CallsFor(method string) []Call {
 
 func (m *MockRemoteAdapter) List(ctx context.Context, path string) ([]remote.FileInfo, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("List", path)
-	if m.ListFunc != nil {
-		return m.ListFunc(ctx, path)
+	fn := m.ListFunc
+	items := m.ListItems
+	fallbackErr := m.ListErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path)
 	}
-	return m.ListItems, m.ListErr
+	return items, fallbackErr
 }
 
 func (m *MockRemoteAdapter) Stat(ctx context.Context, path string) (remote.FileInfo, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Stat", path)
-	if m.StatFunc != nil {
-		return m.StatFunc(ctx, path)
+	fn := m.StatFunc
+	result := m.StatResult
+	fallbackErr := m.StatErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path)
 	}
-	return m.StatResult, m.StatErr
+	return result, fallbackErr
 }
 
 func (m *MockRemoteAdapter) Get(ctx context.Context, path string, dest io.Writer) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Get", path)
-	if m.GetFunc != nil {
-		return m.GetFunc(ctx, path, dest)
+	fn := m.GetFunc
+	data := m.GetData
+	fallbackErr := m.GetErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path, dest)
 	}
-	if m.GetData != nil {
-		if _, err := dest.Write(m.GetData); err != nil {
-			return err
+	if data != nil {
+		if _, writeErr := dest.Write(data); writeErr != nil {
+			return writeErr
 		}
 	}
-	return m.GetErr
+	return fallbackErr
 }
 
 func (m *MockRemoteAdapter) GetRange(ctx context.Context, path string, offset, length int64, dest io.Writer) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("GetRange", path, offset, length)
-	if m.GetRangeFunc != nil {
-		return m.GetRangeFunc(ctx, path, offset, length, dest)
+	fn := m.GetRangeFunc
+	fallbackErr := m.GetRangeErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path, offset, length, dest)
 	}
-	return m.GetRangeErr
+	return fallbackErr
 }
 
 func (m *MockRemoteAdapter) Put(ctx context.Context, path string, src io.Reader, size int64, mtime time.Time) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Put", path, size)
-	if m.PutFunc != nil {
-		return m.PutFunc(ctx, path, src, size, mtime)
+	fn := m.PutFunc
+	fallbackErr := m.PutErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path, src, size, mtime)
 	}
-	return m.PutErr
+	return fallbackErr
 }
 
 func (m *MockRemoteAdapter) Delete(ctx context.Context, path string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Delete", path)
-	if m.DeleteFunc != nil {
-		return m.DeleteFunc(ctx, path)
+	fn := m.DeleteFunc
+	fallbackErr := m.DeleteErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path)
 	}
-	return m.DeleteErr
+	return fallbackErr
 }
 
 func (m *MockRemoteAdapter) Mkdir(ctx context.Context, path string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Mkdir", path)
-	if m.MkdirFunc != nil {
-		return m.MkdirFunc(ctx, path)
+	fn := m.MkdirFunc
+	fallbackErr := m.MkdirErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, path)
 	}
-	return m.MkdirErr
+	return fallbackErr
 }
 
 func (m *MockRemoteAdapter) Rename(ctx context.Context, src, dst string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Rename", src, dst)
-	if m.RenameFunc != nil {
-		return m.RenameFunc(ctx, src, dst)
+	fn := m.RenameFunc
+	fallbackErr := m.RenameErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, src, dst)
 	}
-	return m.RenameErr
+	return fallbackErr
 }
 
 func (m *MockRemoteAdapter) Probe(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Probe")
-	if m.ProbeFunc != nil {
-		return m.ProbeFunc(ctx)
-	}
-	if m.probeIdx < len(m.ProbeErrs) {
-		err := m.ProbeErrs[m.probeIdx]
+	fn := m.ProbeFunc
+	var scriptedErr error
+	scriptedValid := false
+	if fn == nil && m.probeIdx < len(m.ProbeErrs) {
+		scriptedErr = m.ProbeErrs[m.probeIdx]
+		scriptedValid = true
 		m.probeIdx++
-		return err
+	}
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx)
+	}
+	if scriptedValid {
+		return scriptedErr
 	}
 	return nil
 }
 
 func (m *MockRemoteAdapter) Quota(ctx context.Context) (remote.QuotaInfo, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("Quota")
-	if m.QuotaFunc != nil {
-		return m.QuotaFunc(ctx)
+	fn := m.QuotaFunc
+	result := m.QuotaResult
+	fallbackErr := m.QuotaErr
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx)
 	}
-	return m.QuotaResult, m.QuotaErr
+	return result, fallbackErr
 }
 
 func (m *MockRemoteAdapter) SupportsRange() bool {
