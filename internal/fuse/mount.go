@@ -25,8 +25,8 @@ type MountOptions struct {
 	// Adapter is the remote storage backend. Nil for backing-dir mode.
 	Adapter remote.RemoteAdapter
 	// Monitor is the connectivity monitor. Nil for backing-dir mode.
-	// When non-nil, downloads are cancelled on OFFLINE and Open returns
-	// ENOENT for uncached files while offline.
+	// When non-nil, downloads are cancelled on OFFLINE and lazy download
+	// reads fail for uncached files while offline.
 	Monitor *connectivity.Monitor
 	// ReadAhead is the maximum number of bytes the sequential download
 	// goroutine may get ahead of the reader's current position.

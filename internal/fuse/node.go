@@ -374,22 +374,11 @@ func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 			return nil, 0, syscall.EIO
 		}
 		if entry != nil && (entry.State == cache.StateEvicted || entry.State == cache.StateDownloading) {
-			// Refuse to start a new download while offline — the file is not
-			// locally available and we cannot reach the remote.
-			if entry.State == cache.StateEvicted &&
-				n.root.monitor != nil &&
-				n.root.monitor.State() == connectivity.StateOffline {
-				return nil, 0, syscall.ENOENT
-			}
-			dl, readFile, err := n.root.downloadMgr.Start(n.rel, entry.Size)
-			if err != nil {
-				return nil, 0, syscall.EIO
-			}
 			return &downloadFileHandle{
-				f:    readFile,
-				dl:   dl,
-				path: n.rel,
-				mgr:  n.root.downloadMgr,
+				path:    n.rel,
+				totalSz: entry.Size,
+				mgr:     n.root.downloadMgr,
+				monitor: n.root.monitor,
 			}, 0, 0
 		}
 	}
@@ -407,7 +396,7 @@ func (n *FuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 			if corrupt := verifyCacheFile(f, entry.Checksum); corrupt {
 				f.Close()
 				_ = n.root.cache.DB().SetState(n.rel, cache.StateEvicted)
-				// Retry Open — the evicted state will trigger a fresh download.
+				// Retry Open — subsequent reads will trigger a fresh download.
 				return n.Open(ctx, flags)
 			}
 		}
@@ -563,16 +552,47 @@ func (fh *fileHandle) Release(ctx context.Context) syscall.Errno {
 // downloadFileHandle wraps a file being downloaded from a remote. Read calls
 // block until the requested range is available. Write is not supported.
 type downloadFileHandle struct {
-	f    *os.File
-	dl   *download.Download
-	path string
-	mgr  *download.Manager
+	mu      sync.Mutex
+	f       *os.File
+	dl      *download.Download
+	path    string
+	totalSz int64
+	mgr     *download.Manager
+	monitor *connectivity.Monitor
 }
 
 var _ fs.FileReader = (*downloadFileHandle)(nil)
 var _ fs.FileReleaser = (*downloadFileHandle)(nil)
 
+func (dh *downloadFileHandle) ensureStarted() syscall.Errno {
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+
+	if dh.dl != nil {
+		return 0
+	}
+
+	// Opening an evicted file should succeed even while offline, but the first
+	// read must fail until connectivity is restored.
+	if dh.monitor != nil && dh.monitor.State() == connectivity.StateOffline {
+		return syscall.ENOENT
+	}
+
+	dl, readFile, err := dh.mgr.Start(dh.path, dh.totalSz)
+	if err != nil {
+		return toErrno(err)
+	}
+
+	dh.dl = dl
+	dh.f = readFile
+	return 0
+}
+
 func (dh *downloadFileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadResult, syscall.Errno) {
+	if errno := dh.ensureStarted(); errno != 0 {
+		return nil, errno
+	}
+
 	// Use the Download reference directly so range checks remain correct
 	// even after the download has been removed from the manager's map
 	// (e.g. following an OFFLINE cancellation).
@@ -592,8 +612,20 @@ func (dh *downloadFileHandle) Read(ctx context.Context, dest []byte, off int64) 
 }
 
 func (dh *downloadFileHandle) Release(ctx context.Context) syscall.Errno {
-	err := dh.f.Close()
-	dh.dl.ReleaseReader()
+	dh.mu.Lock()
+	f := dh.f
+	dl := dh.dl
+	dh.f = nil
+	dh.dl = nil
+	dh.mu.Unlock()
+
+	var err error
+	if f != nil {
+		err = f.Close()
+	}
+	if dl != nil {
+		dl.ReleaseReader()
+	}
 	if err != nil {
 		return toErrno(err)
 	}
