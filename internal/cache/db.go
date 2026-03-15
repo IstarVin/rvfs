@@ -126,8 +126,8 @@ func applySchema(db *sql.DB) error {
 		}
 
 		// Split by semicolon to handle multiple statements per file
-		statements := strings.Split(string(content), ";")
-		for _, stmt := range statements {
+		statements := strings.SplitSeq(string(content), ";")
+		for stmt := range statements {
 			stmt = strings.TrimSpace(stmt)
 			if stmt == "" {
 				continue
@@ -270,8 +270,8 @@ func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
 		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
 		       pinned, last_access
 		FROM files
-		WHERE path LIKE ? AND path != ?`,
-		prefix+"%", dirPath)
+		WHERE path LIKE ? AND path NOT LIKE ?`,
+		prefix+"%", prefix+"%/%")
 	if err != nil {
 		return nil, fmt.Errorf("list dir %q: %w", dirPath, err)
 	}
@@ -286,12 +286,6 @@ func (m *MetadataDB) ListDir(dirPath string) ([]*FileEntry, error) {
 			&e.SyncError, &e.RetryAfter, &e.Checksum,
 			&e.Pinned, &e.LastAccess); err != nil {
 			return nil, fmt.Errorf("scan dir entry: %w", err)
-		}
-		// Filter to immediate children only: the relative portion after the
-		// prefix must not contain a "/".
-		rel := strings.TrimPrefix(e.Path, prefix)
-		if strings.Contains(rel, "/") {
-			continue
 		}
 		result = append(result, e)
 	}
