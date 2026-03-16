@@ -740,7 +740,7 @@ func (m *MetadataDB) ListEvictable() ([]*FileEntry, error) {
 		       cache_path, state, cached_ranges, sync_error, retry_after, checksum,
 		       pinned, last_access
 		FROM files
-		WHERE state = 'clean' AND pinned = 0 AND is_dir = 0
+		WHERE (cached_ranges != '' OR state IN ('downloading', 'clean')) AND pinned = 0 AND is_dir = 0
 		ORDER BY last_access ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list evictable: %w", err)
