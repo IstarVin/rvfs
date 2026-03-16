@@ -35,10 +35,11 @@ func newTestMountHandler(t *testing.T, adapter *testutil.MockRemoteAdapter) (*mo
 func putPrefetchEntry(t *testing.T, cl *cache.CacheLayer, path string, size int64) {
 	t.Helper()
 	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
-		Path:  path,
-		Mode:  0100644,
-		Size:  size,
-		State: cache.StateEvicted,
+		Path:   path,
+		Mode:   0100644,
+		Size:   size,
+		Pinned: true,
+		State:  cache.StateEvicted,
 	}))
 }
 
@@ -298,4 +299,93 @@ func TestMountHandlerDownloadsQueuedPathFilter(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return !mgr.IsDownloading("a.bin") && !mgr.IsDownloading("b.bin") && !mgr.IsDownloading("c.bin")
 	}, 3*time.Second, 20*time.Millisecond)
+}
+
+func TestMountHandlerEvictCancelsActiveDownload(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, _ string, _ io.Writer) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	h, mgr, cl := newTestMountHandler(t, adapter)
+	putPrefetchEntry(t, cl, "active.bin", 64)
+
+	require.NoError(t, h.HandlePrefetch("active.bin", false))
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active prefetch to start")
+	}
+
+	require.NoError(t, h.HandleEvict("active.bin"))
+	require.Eventually(t, func() bool {
+		return !mgr.IsDownloading("active.bin")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	e, err := cl.DB().GetFile("active.bin")
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	assert.Equal(t, cache.StateEvicted, e.State)
+}
+
+func TestMountHandlerEvictSkipsQueuedSequentialPrefetch(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan string, 2)
+	release := make(chan struct{}, 1)
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			started <- path
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			_, err := dest.Write([]byte("data"))
+			return err
+		},
+	}
+
+	h, mgr, cl := newTestMountHandler(t, adapter)
+	putPrefetchEntry(t, cl, "a.bin", 4)
+	putPrefetchEntry(t, cl, "b.bin", 4)
+
+	h.startPrefetchWorker()
+	t.Cleanup(h.stopPrefetchWorker)
+
+	require.NoError(t, h.HandlePrefetch("a.bin", true))
+	require.NoError(t, h.HandlePrefetch("b.bin", true))
+
+	select {
+	case got := <-started:
+		require.Equal(t, "a.bin", got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first prefetch to start")
+	}
+
+	require.NoError(t, cl.DB().SetPinned("b.bin", false))
+	require.NoError(t, h.HandleEvict("b.bin"))
+
+	release <- struct{}{}
+	require.Eventually(t, func() bool {
+		return !mgr.IsDownloading("a.bin") && !mgr.IsDownloading("b.bin")
+	}, 3*time.Second, 20*time.Millisecond)
+
+	select {
+	case got := <-started:
+		t.Fatalf("unexpected queued prefetch start after evict: %s", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	resp, err := h.HandleDownloads("b.bin")
+	require.NoError(t, err)
+	require.Len(t, resp.Entries, 1)
+	assert.Equal(t, "b.bin", resp.Entries[0].Path)
+	assert.Equal(t, string(cache.StateEvicted), resp.Entries[0].State)
 }

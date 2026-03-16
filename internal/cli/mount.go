@@ -674,6 +674,14 @@ func (h *mountHandler) startPrefetchWorker() {
 		defer h.prefetchWG.Done()
 		for req := range h.prefetchQ {
 			h.dequeuePrefetch(req)
+			entry, err := h.cl.DB().GetFile(req.path)
+			if err != nil {
+				slog.Warn("prefetch queue: lookup failed", "path", req.path, "err", err)
+				continue
+			}
+			if entry == nil || entry.IsDir || !entry.Pinned {
+				continue
+			}
 			if err := h.downloadMgr.Prefetch(req.path, req.size); err != nil {
 				slog.Warn("prefetch queue: start failed", "path", req.path, "err", err)
 				continue
@@ -698,6 +706,10 @@ func (h *mountHandler) HandleEvict(path string) error {
 	if path == "" {
 		return fmt.Errorf("evict: missing path")
 	}
+	if h.downloadMgr != nil {
+		h.downloadMgr.Cancel(path)
+	}
+	h.removePrefetchPath(path)
 	return cache.EvictPath(h.cl, path)
 }
 
@@ -787,6 +799,23 @@ func (h *mountHandler) dequeuePrefetch(req prefetchRequest) {
 			return
 		}
 	}
+}
+
+func (h *mountHandler) removePrefetchPath(path string) {
+	h.prefetchMu.Lock()
+	defer h.prefetchMu.Unlock()
+
+	if len(h.prefetchView) == 0 {
+		return
+	}
+
+	out := h.prefetchView[:0]
+	for _, req := range h.prefetchView {
+		if req.path != path {
+			out = append(out, req)
+		}
+	}
+	h.prefetchView = out
 }
 
 func (h *mountHandler) snapshotPrefetchQueue(path string) []prefetchRequest {
