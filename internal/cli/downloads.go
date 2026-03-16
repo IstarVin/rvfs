@@ -48,12 +48,15 @@ var downloadsCmd = &cobra.Command{
 		}
 
 		active := 0
+		queued := 0
 		failed := 0
 		completed := 0
 		for _, e := range resp.Entries {
 			switch {
 			case e.Err != "":
 				failed++
+			case e.State == "queued":
+				queued++
 			case e.Done:
 				completed++
 			default:
@@ -62,12 +65,14 @@ var downloadsCmd = &cobra.Command{
 		}
 
 		printSection(cmd.OutOrStdout(), fmt.Sprintf("Downloads for %s", args[0]))
-		fprintf(cmd.OutOrStdout(), "%d tracked, %d active, %d complete, %d with errors\n", len(resp.Entries), active, completed, failed)
+		fprintf(cmd.OutOrStdout(), "%d tracked, %d queued, %d active, %d complete, %d with errors\n", len(resp.Entries), queued, active, completed, failed)
 
 		rows := make([][]string, 0, len(resp.Entries))
 		for _, e := range resp.Entries {
 			progress := "-"
-			if e.TotalSize > 0 {
+			if e.State == "queued" {
+				progress = mutedStyle.Render("queued")
+			} else if e.TotalSize > 0 {
 				pct := float64(e.Downloaded) / float64(e.TotalSize) * 100
 				if pct < 0 {
 					pct = 0

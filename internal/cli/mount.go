@@ -544,6 +544,8 @@ type mountHandler struct {
 	cacheDir     string
 
 	prefetchQ    chan prefetchRequest
+	prefetchMu   sync.Mutex
+	prefetchView []prefetchRequest
 	prefetchWG   sync.WaitGroup
 	prefetchStop sync.Once
 }
@@ -652,7 +654,9 @@ func (h *mountHandler) HandlePrefetch(path string, sequential bool) error {
 		if h.prefetchQ == nil {
 			return fmt.Errorf("prefetch queue unavailable")
 		}
-		h.prefetchQ <- prefetchRequest{path: path, size: entry.Size}
+		req := prefetchRequest{path: path, size: entry.Size}
+		h.enqueuePrefetch(req)
+		h.prefetchQ <- req
 		return nil
 	}
 	if err := h.downloadMgr.Prefetch(path, entry.Size); err != nil {
@@ -669,6 +673,7 @@ func (h *mountHandler) startPrefetchWorker() {
 	go func() {
 		defer h.prefetchWG.Done()
 		for req := range h.prefetchQ {
+			h.dequeuePrefetch(req)
 			if err := h.downloadMgr.Prefetch(req.path, req.size); err != nil {
 				slog.Warn("prefetch queue: start failed", "path", req.path, "err", err)
 				continue
@@ -702,7 +707,26 @@ func (h *mountHandler) HandleDownloads(path string) (ipc.DownloadStatusResponse,
 		return resp, nil
 	}
 
-	for _, s := range h.downloadMgr.Snapshots(path) {
+	active := h.downloadMgr.Snapshots(path)
+	activeByPath := make(map[string]struct{}, len(active))
+	for _, s := range active {
+		activeByPath[s.Path] = struct{}{}
+	}
+
+	for _, req := range h.snapshotPrefetchQueue(path) {
+		if _, ok := activeByPath[req.path]; ok {
+			continue
+		}
+		resp.Entries = append(resp.Entries, ipc.DownloadStatusEntry{
+			Path:       req.path,
+			State:      "queued",
+			Downloaded: 0,
+			TotalSize:  req.size,
+			Done:       false,
+		})
+	}
+
+	for _, s := range active {
 		resp.Entries = append(resp.Entries, ipc.DownloadStatusEntry{
 			Path:       s.Path,
 			State:      s.State,
@@ -736,6 +760,55 @@ func (h *mountHandler) HandleDownloads(path string) (ipc.DownloadStatusResponse,
 	}
 
 	return resp, nil
+}
+
+func (h *mountHandler) enqueuePrefetch(req prefetchRequest) {
+	h.prefetchMu.Lock()
+	h.prefetchView = append(h.prefetchView, req)
+	h.prefetchMu.Unlock()
+}
+
+func (h *mountHandler) dequeuePrefetch(req prefetchRequest) {
+	h.prefetchMu.Lock()
+	defer h.prefetchMu.Unlock()
+
+	if len(h.prefetchView) == 0 {
+		return
+	}
+
+	if h.prefetchView[0] == req {
+		h.prefetchView = h.prefetchView[1:]
+		return
+	}
+
+	for i, item := range h.prefetchView {
+		if item == req {
+			h.prefetchView = append(h.prefetchView[:i], h.prefetchView[i+1:]...)
+			return
+		}
+	}
+}
+
+func (h *mountHandler) snapshotPrefetchQueue(path string) []prefetchRequest {
+	h.prefetchMu.Lock()
+	defer h.prefetchMu.Unlock()
+
+	if len(h.prefetchView) == 0 {
+		return nil
+	}
+	if path == "" {
+		out := make([]prefetchRequest, len(h.prefetchView))
+		copy(out, h.prefetchView)
+		return out
+	}
+
+	out := make([]prefetchRequest, 0, len(h.prefetchView))
+	for _, req := range h.prefetchView {
+		if req.path == path {
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 func (h *mountHandler) HandleUploads(path string) (ipc.UploadStatusResponse, error) {

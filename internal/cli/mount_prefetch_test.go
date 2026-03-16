@@ -10,6 +10,7 @@ import (
 
 	"github.com/IstarVin/rvfs/internal/cache"
 	"github.com/IstarVin/rvfs/internal/download"
+	"github.com/IstarVin/rvfs/internal/ipc"
 	"github.com/IstarVin/rvfs/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -180,4 +181,121 @@ func TestMountHandlerStopPrefetchWorkerIsIdempotent(t *testing.T) {
 		h.stopPrefetchWorker()
 	}()
 	wg.Wait()
+}
+
+func TestMountHandlerDownloadsIncludesQueuedSequentialPrefetch(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan string, 4)
+	release := make(chan struct{}, 3)
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			started <- path
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			_, err := dest.Write([]byte("data"))
+			return err
+		},
+	}
+
+	h, mgr, cl := newTestMountHandler(t, adapter)
+	for _, p := range []string{"a.bin", "b.bin", "c.bin"} {
+		putPrefetchEntry(t, cl, p, 4)
+	}
+
+	h.startPrefetchWorker()
+	t.Cleanup(h.stopPrefetchWorker)
+
+	require.NoError(t, h.HandlePrefetch("a.bin", true))
+	require.NoError(t, h.HandlePrefetch("b.bin", true))
+	require.NoError(t, h.HandlePrefetch("c.bin", true))
+
+	select {
+	case got := <-started:
+		require.Equal(t, "a.bin", got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first prefetch to start")
+	}
+
+	resp, err := h.HandleDownloads("")
+	require.NoError(t, err)
+
+	statesByPath := make(map[string]string, len(resp.Entries))
+	for _, e := range resp.Entries {
+		statesByPath[e.Path] = e.State
+	}
+	require.Equal(t, "downloading", statesByPath["a.bin"])
+	require.Equal(t, "queued", statesByPath["b.bin"])
+	require.Equal(t, "queued", statesByPath["c.bin"])
+
+	queued := make([]ipc.DownloadStatusEntry, 0, 2)
+	for _, e := range resp.Entries {
+		if e.State == "queued" {
+			queued = append(queued, e)
+		}
+	}
+	require.Len(t, queued, 2)
+	assert.Equal(t, "b.bin", queued[0].Path)
+	assert.Equal(t, "c.bin", queued[1].Path)
+
+	release <- struct{}{}
+	release <- struct{}{}
+	release <- struct{}{}
+	require.Eventually(t, func() bool {
+		return !mgr.IsDownloading("a.bin") && !mgr.IsDownloading("b.bin") && !mgr.IsDownloading("c.bin")
+	}, 3*time.Second, 20*time.Millisecond)
+}
+
+func TestMountHandlerDownloadsQueuedPathFilter(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan string, 4)
+	release := make(chan struct{}, 3)
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, path string, dest io.Writer) error {
+			started <- path
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			_, err := dest.Write([]byte("data"))
+			return err
+		},
+	}
+
+	h, mgr, cl := newTestMountHandler(t, adapter)
+	for _, p := range []string{"a.bin", "b.bin", "c.bin"} {
+		putPrefetchEntry(t, cl, p, 4)
+	}
+
+	h.startPrefetchWorker()
+	t.Cleanup(h.stopPrefetchWorker)
+
+	require.NoError(t, h.HandlePrefetch("a.bin", true))
+	require.NoError(t, h.HandlePrefetch("b.bin", true))
+	require.NoError(t, h.HandlePrefetch("c.bin", true))
+
+	select {
+	case got := <-started:
+		require.Equal(t, "a.bin", got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first prefetch to start")
+	}
+
+	resp, err := h.HandleDownloads("c.bin")
+	require.NoError(t, err)
+	require.Len(t, resp.Entries, 1)
+	assert.Equal(t, "c.bin", resp.Entries[0].Path)
+	assert.Equal(t, "queued", resp.Entries[0].State)
+
+	release <- struct{}{}
+	release <- struct{}{}
+	release <- struct{}{}
+	require.Eventually(t, func() bool {
+		return !mgr.IsDownloading("a.bin") && !mgr.IsDownloading("b.bin") && !mgr.IsDownloading("c.bin")
+	}, 3*time.Second, 20*time.Millisecond)
 }
