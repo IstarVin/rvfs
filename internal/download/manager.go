@@ -63,20 +63,34 @@ type Manager struct {
 	downloads map[string]*Download
 	stopCh    chan struct{}
 	closeOnce sync.Once
+
+	// foregroundPaths tracks paths that currently have an active FUSE reader
+	// (a downloadFileHandle that has been opened). Background prefetch goroutines
+	// for any *other* path yield while this map is non-empty, so reads always
+	// get full bandwidth over background pin downloads.
+	// Protected by Manager.mu.
+	foregroundPaths map[string]int
+
+	// foregroundCond is broadcast whenever foregroundPaths changes or a download
+	// is cancelled, allowing blocked background goroutines to re-evaluate.
+	// Guarded by Manager.mu.
+	foregroundCond *sync.Cond
 }
 
 // NewManager creates a Download Manager. monitor may be nil; when non-nil,
 // any active download is cancelled automatically when connectivity is lost.
 func NewManager(adapter remote.RemoteAdapter, cl *cache.CacheLayer, monitor *connectivity.Monitor, opts ManagerOptions) *Manager {
 	m := &Manager{
-		adapter:     adapter,
-		cache:       cl,
-		monitor:     monitor,
-		readAhead:   opts.ReadAhead,
-		idleTimeout: opts.IdleTimeout,
-		downloads:   make(map[string]*Download),
-		stopCh:      make(chan struct{}),
+		adapter:         adapter,
+		cache:           cl,
+		monitor:         monitor,
+		readAhead:       opts.ReadAhead,
+		idleTimeout:     opts.IdleTimeout,
+		downloads:       make(map[string]*Download),
+		stopCh:          make(chan struct{}),
+		foregroundPaths: make(map[string]int),
 	}
+	m.foregroundCond = sync.NewCond(&m.mu)
 	if monitor != nil {
 		go m.watchOffline()
 	}
@@ -375,11 +389,41 @@ func (m *Manager) Cancel(path string) {
 	if ok {
 		delete(m.downloads, path)
 	}
+	// Wake any background goroutine waiting in the foreground-yield loop so it
+	// can observe that the download has been removed and exit cleanly.
+	m.foregroundCond.Broadcast()
 	m.mu.Unlock()
 
 	if ok {
 		dl.cancel()
 	}
+}
+
+// MarkForeground records that a FUSE downloadFileHandle for path has been
+// opened. Background prefetch goroutines for OTHER paths will pause until the
+// last foreground reader calls UnmarkForeground, yielding bandwidth to the
+// active reader (e.g. a video being played).
+func (m *Manager) MarkForeground(path string) {
+	m.mu.Lock()
+	m.foregroundPaths[path]++
+	// Broadcast so a background goroutine paused on a different file (that is
+	// now the foreground file) can wake and check whether its own path is
+	// foreground (promotion case).
+	m.foregroundCond.Broadcast()
+	m.mu.Unlock()
+}
+
+// UnmarkForeground records that a FUSE downloadFileHandle for path has been
+// released. When the last reader releases, background prefetch goroutines are
+// allowed to run again.
+func (m *Manager) UnmarkForeground(path string) {
+	m.mu.Lock()
+	m.foregroundPaths[path]--
+	if m.foregroundPaths[path] <= 0 {
+		delete(m.foregroundPaths, path)
+	}
+	m.foregroundCond.Broadcast()
+	m.mu.Unlock()
 }
 
 // IsDownloading returns true if a download is in progress for path.
@@ -651,6 +695,36 @@ func (dl *Download) downloadLoop(id int64, startOffset int64, isSequential bool,
 			if nextCovered && !isSequential {
 				pr.Close()
 				return
+			}
+
+			// Foreground-read preemption: when this is a background prefetch
+			// goroutine and any *other* file is being actively read by a FUSE
+			// handle, pause here so the reader gets full bandwidth.
+			//
+			// The goroutine is NOT paused if this download's own path is the
+			// foreground file (promotion: file was pinned then opened by the
+			// user — we should keep downloading it at full speed).
+			if isSequential {
+				dl.mu.Lock()
+				isPrefetch := dl.prefetch
+				dl.mu.Unlock()
+
+				if isPrefetch {
+					dl.mgr.mu.Lock()
+					for len(dl.mgr.foregroundPaths) > 0 {
+						if _, selfFg := dl.mgr.foregroundPaths[dl.path]; selfFg {
+							break // our own file is being read — don't pause it
+						}
+						// Check if the download was cancelled while we waited.
+						if _, ok := dl.mgr.downloads[dl.path]; !ok {
+							dl.mgr.mu.Unlock()
+							pr.Close()
+							return
+						}
+						dl.mgr.foregroundCond.Wait()
+					}
+					dl.mgr.mu.Unlock()
+				}
 			}
 
 			// Read-ahead throttle (sequential goroutine only).

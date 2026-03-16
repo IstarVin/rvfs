@@ -875,3 +875,145 @@ func TestManagerConcurrentMultiFileDownload(t *testing.T) {
 		assert.Equal(t, contentFor(name), buf[:n], "content mismatch for %s", name)
 	}
 }
+
+// ---------- Foreground-read preemption tests ----------
+
+// TestManagerForegroundPreemptsBackgroundPrefetch verifies that while a FUSE
+// reader has marked a file as foreground, a background prefetch for a *different*
+// file is paused and only resumes after the reader releases.
+func TestManagerForegroundPreemptsBackgroundPrefetch(t *testing.T) {
+	t.Parallel()
+
+	// 3 MiB — enough for three 1-MiB chunk iterations, each of which hits the
+	// foreground yield point. With io.Pipe (zero-buffered), after the first
+	// chunk is processed and the goroutine pauses, the adapter goroutine blocks
+	// trying to write chunk 2, so the download cannot complete while paused.
+	const totalSize = int64(3 * 1024 * 1024)
+	content := bytes.Repeat([]byte("p"), int(totalSize))
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, _ string, dest io.Writer) error {
+			_, err := dest.Write(content)
+			return err
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "bg.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	// Simulate an open FUSE reader for a *different* file before prefetch starts.
+	mgr.MarkForeground("fg.bin")
+
+	require.NoError(t, mgr.Prefetch("bg.bin", totalSize))
+
+	// Wait for the first chunk to be processed (progress > 0), proving the
+	// goroutine started and reached the yield point.
+	require.Eventually(t, func() bool {
+		snaps := mgr.Snapshots("bg.bin")
+		return len(snaps) > 0 && snaps[0].Downloaded > 0
+	}, 3*time.Second, 10*time.Millisecond, "first chunk should be downloaded before pause")
+
+	// The download must still be in progress: the goroutine is blocked at the
+	// foreground yield and the adapter is blocked on the zero-buffered pipe.
+	assert.True(t, mgr.IsDownloading("bg.bin"), "background prefetch should be paused while fg reader is active")
+
+	// Release the foreground reader — background prefetch should now complete.
+	mgr.UnmarkForeground("fg.bin")
+
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("bg.bin")
+		return err == nil && e != nil && e.State == cache.StateClean
+	}, 5*time.Second, 20*time.Millisecond, "prefetch should complete after foreground reader releases")
+}
+
+// TestManagerForegroundSelfNotPaused verifies that a background prefetch is
+// NOT paused when the foreground file is the *same* path being prefetched —
+// the promotion case where the user opens a file that is already being pinned.
+func TestManagerForegroundSelfNotPaused(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(3 * 1024 * 1024)
+	content := bytes.Repeat([]byte("q"), int(totalSize))
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(_ context.Context, _ string, dest io.Writer) error {
+			_, err := dest.Write(content)
+			return err
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "both.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	// Mark the *same* path as foreground before starting the prefetch.
+	mgr.MarkForeground("both.bin")
+	t.Cleanup(func() { mgr.UnmarkForeground("both.bin") })
+
+	require.NoError(t, mgr.Prefetch("both.bin", totalSize))
+
+	// Should complete at full speed — the self-foreground check should prevent
+	// any pausing even though foregroundPaths is non-empty.
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("both.bin")
+		return err == nil && e != nil && e.State == cache.StateClean
+	}, 5*time.Second, 20*time.Millisecond,
+		"prefetch should not be paused when it is itself the foreground file")
+}
+
+// TestManagerForegroundWakeOnCancel verifies that a background prefetch goroutine
+// blocked in the foreground-yield loop exits cleanly when its download is cancelled,
+// without deadlocking or hanging.
+func TestManagerForegroundWakeOnCancel(t *testing.T) {
+	t.Parallel()
+
+	const totalSize = int64(3 * 1024 * 1024)
+	content := bytes.Repeat([]byte("r"), int(totalSize))
+
+	adapter := &testutil.MockRemoteAdapter{
+		GetFunc: func(ctx context.Context, _ string, dest io.Writer) error {
+			_, err := dest.Write(content)
+			return err
+		},
+	}
+
+	mgr, cl := newTestManager(t, adapter, ManagerOptions{})
+	require.NoError(t, cl.DB().PutFile(&cache.FileEntry{
+		Path: "cancel-fg.bin", State: cache.StateEvicted, Mode: 0100644,
+		Size: totalSize,
+	}))
+
+	// Mark a different file as foreground to force the prefetch to pause.
+	mgr.MarkForeground("blocker.bin")
+	t.Cleanup(func() { mgr.UnmarkForeground("blocker.bin") })
+
+	require.NoError(t, mgr.Prefetch("cancel-fg.bin", totalSize))
+
+	// Wait for at least one chunk: the goroutine is now blocked in the yield.
+	require.Eventually(t, func() bool {
+		snaps := mgr.Snapshots("cancel-fg.bin")
+		return len(snaps) > 0 && snaps[0].Downloaded > 0
+	}, 3*time.Second, 10*time.Millisecond, "first chunk should be processed before cancel")
+
+	// Cancel the download while the goroutine is blocked waiting on foregroundCond.
+	// Cancel() broadcasts foregroundCond, so the goroutine wakes, sees itself
+	// removed from m.downloads, and exits cleanly.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mgr.Cancel("cancel-fg.bin")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Cancel() blocked: background goroutine did not exit from foreground yield")
+	}
+
+	assert.False(t, mgr.IsDownloading("cancel-fg.bin"))
+}

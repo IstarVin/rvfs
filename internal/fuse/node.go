@@ -588,6 +588,7 @@ func (dh *downloadFileHandle) ensureStarted() syscall.Errno {
 
 	dh.dl = dl
 	dh.f = readFile
+	dh.mgr.MarkForeground(dh.path)
 	return 0
 }
 
@@ -627,6 +628,7 @@ func (dh *downloadFileHandle) Release(ctx context.Context) syscall.Errno {
 		err = f.Close()
 	}
 	if dl != nil {
+		dh.mgr.UnmarkForeground(dh.path)
 		dl.ReleaseReader()
 	}
 	if err != nil {
