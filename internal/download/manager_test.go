@@ -396,6 +396,12 @@ func TestDownloadNetworkErrorMidStream(t *testing.T) {
 		return !mgr.IsDownloading("partial.bin")
 	}, 2*time.Second, 10*time.Millisecond,
 		"download should be removed from manager after error")
+
+	require.Eventually(t, func() bool {
+		e, err := cl.Stat("partial.bin")
+		return err == nil && e != nil && e.State == cache.StateEvicted
+	}, 2*time.Second, 10*time.Millisecond,
+		"error path should transition to StateEvicted, not remain StateDownloading")
 }
 
 // TestDownloadContextCancelledOnDone verifies that calling Cancel on an active

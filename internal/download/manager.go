@@ -556,13 +556,15 @@ func (dl *Download) downloadLoop(id int64, startOffset int64, isSequential bool,
 			dl.done = true
 			go dl.finish()
 		} else if remaining == 0 && dl.err != nil && !dl.done {
-			// All goroutines have exited due to error — remove from manager map
-			// so future Start() calls can retry the download.
+			// All goroutines have exited due to error. Persist partial ranges and
+			// transition to StateEvicted so we never leave a stale
+			// StateDownloading row behind.
 			dl.done = true
 			go func() {
 				dl.mgr.mu.Lock()
 				delete(dl.mgr.downloads, dl.path)
 				dl.mgr.mu.Unlock()
+				dl.cancel()
 			}()
 		}
 		// Always broadcast so waiters in waitForRange can re-evaluate
@@ -790,6 +792,21 @@ func isSQLiteBusyErr(err error) bool {
 		strings.Contains(msg, "sqlite_busy")
 }
 
+func putFileWithRetry(db interface{ PutFile(*cache.FileEntry) error }, entry *cache.FileEntry) error {
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := db.PutFile(entry)
+		if err == nil {
+			return nil
+		}
+		if !isSQLiteBusyErr(err) || attempt == maxAttempts {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+	}
+	return nil
+}
+
 func (dl *Download) closeFinished() {
 	dl.finishedOnce.Do(func() { close(dl.finishedCh) })
 }
@@ -817,7 +834,7 @@ func (dl *Download) finish() {
 		if checksum != "" {
 			entry.Checksum = checksum
 		}
-		_ = dl.mgr.cache.DB().PutFile(entry)
+		_ = putFileWithRetry(dl.mgr.cache.DB(), entry)
 	}
 
 	dl.mgr.mu.Lock()
@@ -846,7 +863,7 @@ func (dl *Download) cancel() {
 	if err == nil && entry != nil {
 		entry.CachedRanges = string(rangesJSON)
 		entry.State = cache.StateEvicted
-		_ = dl.mgr.cache.DB().PutFile(entry)
+		_ = putFileWithRetry(dl.mgr.cache.DB(), entry)
 	}
 
 	dl.cacheFile.Close()
