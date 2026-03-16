@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -118,6 +119,10 @@ type Download struct {
 	// Periodic persistence state.
 	lastPersist      time.Time
 	bytesSincePersit int64
+
+	// Checkpoint coalescing state.
+	checkpointInFlight bool
+	checkpointPending  string
 
 	// finishedCh is closed (once) when the download completes or is cancelled.
 	// Used to let the offline-watcher goroutine exit cleanly.
@@ -721,11 +726,68 @@ func (dl *Download) persistRangesLocked() {
 	rangesJSON, _ := dl.rangeSet.MarshalJSON()
 	dl.lastPersist = time.Now()
 	dl.bytesSincePersit = 0
+	snapshot := string(rangesJSON)
+
+	if dl.checkpointInFlight {
+		// Keep only the latest snapshot; older ones are obsolete.
+		dl.checkpointPending = snapshot
+		return
+	}
+	dl.checkpointInFlight = true
 
 	// Run DB update without holding the download lock.
-	go func() {
-		_ = dl.mgr.cache.DB().CheckpointRanges(dl.path, string(rangesJSON))
-	}()
+	go dl.flushCheckpoints(snapshot)
+}
+
+func (dl *Download) flushCheckpoints(snapshot string) {
+	for {
+		if err := dl.checkpointRangesWithRetry(snapshot); err != nil {
+			dl.mu.Lock()
+			if dl.checkpointPending == "" {
+				dl.checkpointPending = snapshot
+			}
+			snapshot = dl.checkpointPending
+			dl.checkpointPending = ""
+			dl.mu.Unlock()
+			continue
+		}
+
+		dl.mu.Lock()
+		if dl.checkpointPending == "" {
+			dl.checkpointInFlight = false
+			dl.mu.Unlock()
+			return
+		}
+		snapshot = dl.checkpointPending
+		dl.checkpointPending = ""
+		dl.mu.Unlock()
+	}
+}
+
+func (dl *Download) checkpointRangesWithRetry(snapshot string) error {
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := dl.mgr.cache.DB().CheckpointRanges(dl.path, snapshot)
+		if err == nil {
+			return nil
+		}
+		if !isSQLiteBusyErr(err) || attempt == maxAttempts {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+	}
+	return nil
+}
+
+func isSQLiteBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "sqlitedb is busy") ||
+		strings.Contains(msg, "sqlite_busy")
 }
 
 func (dl *Download) closeFinished() {
